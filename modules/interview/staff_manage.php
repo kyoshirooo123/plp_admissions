@@ -399,7 +399,10 @@ ob_start();
                 <div>
                     <label class="form-label">Capacity <span style="color:var(--error)">*</span></label>
                     <input type="number" name="capacity" class="form-control"
-                           value="30" min="1" max="500" required>
+                           value="<?= INTERVIEW_DAILY_CAP ?>" min="1" max="500" required>
+                    <p style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:var(--space-1)">
+                        Recommended: 40–50 per day. Admin-configured max: <?= (int) school_setting('interview_daily_cap', INTERVIEW_DAILY_CAP) ?>.
+                    </p>
                 </div>
 
             </div>

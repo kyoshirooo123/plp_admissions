@@ -152,6 +152,48 @@ define('RESULT_LABELS', [
     'rejected'   => 'Rejected',
 ]);
 
+// ----------------------------------------------------------------
+// EXAM & INTERVIEW CAPACITY (from client interview)
+// ----------------------------------------------------------------
+define('EXAM_DEFAULT_DURATION',   90);   // 1 hr 30 min default (customizable)
+define('EXAM_ROOM_CAPACITY',      35);   // max applicants per room
+define('EXAM_DAILY_CAP',        3000);   // max applicants per day (all courses)
+define('INTERVIEW_DAILY_CAP',     45);   // max per day (40-50 range; 45 default)
+
+// ----------------------------------------------------------------
+// PER-COURSE PASSING SCORE TIERS
+// Source: client interview — BSIT confirmed; all others use same
+// tier system pending client confirmation of exact passing marks.
+//
+// Ranking tiers (1–10 scale):
+//   High    10, 9, 8, 7  → Passed
+//   Average  6, 5, 4     → Passed
+//   Low      3, 2, 1     → Rejected
+// ----------------------------------------------------------------
+define('SCORE_TIER_HIGH',    ['min' => 7, 'max' => 10, 'label' => 'High',    'verdict' => 'passed']);
+define('SCORE_TIER_AVERAGE', ['min' => 4, 'max' => 6,  'label' => 'Average', 'verdict' => 'passed']);
+define('SCORE_TIER_LOW',     ['min' => 1, 'max' => 3,  'label' => 'Low',     'verdict' => 'rejected']);
+
+// Per-course passing configuration.
+// 'pass_from' = minimum score to pass (scores >= pass_from → Passed).
+// 'confirmed' = true if the client has confirmed the exact threshold.
+// Default: pass_from=4 (Average tier and above pass) per BSIT-confirmed rule.
+define('COURSE_PASSING_SCORES', [
+    'BS Accountancy (BSA)'                                               => ['pass_from' => 4, 'confirmed' => false],
+    'BS Business Administration major in Marketing Management (BSBA)'   => ['pass_from' => 4, 'confirmed' => false],
+    'BS Entrepreneurship (BSENT)'                                        => ['pass_from' => 4, 'confirmed' => false],
+    'BS Hospitality Management (BSHM)'                                   => ['pass_from' => 4, 'confirmed' => false],
+    'Bachelor of Elementary Education (BEED)'                            => ['pass_from' => 4, 'confirmed' => false],
+    'Bachelor of Secondary Education Major in English (BSED-ENG)'       => ['pass_from' => 4, 'confirmed' => false],
+    'Bachelor of Secondary Education Major in Filipino (BSED-FIL)'      => ['pass_from' => 4, 'confirmed' => false],
+    'Bachelor of Secondary Education Major in Mathematics (BSED-MATH)'  => ['pass_from' => 4, 'confirmed' => false],
+    'AB Psychology (AB Psych)'                                           => ['pass_from' => 4, 'confirmed' => false],
+    'BS Computer Science (BSCS)'                                         => ['pass_from' => 4, 'confirmed' => false],
+    'BS Information Technology (BSIT)'                                   => ['pass_from' => 4, 'confirmed' => true],  // confirmed
+    'BS Electronics Engineering (BSECE)'                                 => ['pass_from' => 4, 'confirmed' => false],
+    'BS Nursing (BSN)'                                                   => ['pass_from' => 4, 'confirmed' => false],
+]);
+
 // -- Uploadcare (file storage) -----------------------------------
 define('UPLOADCARE_PUB_KEY',    getenv('UPLOADCARE_PUB_KEY')    ?: '');
 define('UPLOADCARE_SECRET_KEY', getenv('UPLOADCARE_SECRET_KEY') ?: '');

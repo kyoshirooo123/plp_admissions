@@ -103,6 +103,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $errors['applicant_type'] = 'Select an applicant type.';
     if (!in_array($old['course_applied'], PLP_COURSES, true))
         $errors['course_applied'] = 'Select a valid course.';
+    elseif (!empty($old['course_applied'])) {
+        // Check course cap at registration time
+        try {
+            $regYear2 = school_setting('current_school_year', date('Y').'-'.(date('Y')+1));
+            $capChk = db()->prepare(
+                'SELECT cc.max_slots,
+                        COUNT(DISTINCT CASE WHEN r.result="accepted" THEN a.id END) AS accepted
+                 FROM course_caps cc
+                 LEFT JOIN applicants a      ON a.course_applied = cc.course_name AND a.school_year = cc.school_year
+                 LEFT JOIN admission_results r ON r.applicant_id = a.id
+                 WHERE cc.school_year = ? AND cc.course_name = ? AND cc.max_slots IS NOT NULL
+                 GROUP BY cc.max_slots
+                 LIMIT 1'
+            );
+            $capChk->execute([$regYear2, $old['course_applied']]);
+            $capRow = $capChk->fetch();
+            if ($capRow && (int)$capRow['accepted'] >= (int)$capRow['max_slots']) {
+                $errors['course_applied'] = 'This course has reached its enrollment cap for ' . $regYear2 . '. Please choose an available course.';
+            }
+        } catch (\Throwable $e) { /* ignore — table may not exist yet */ }
+    }
     if (strlen($password) < 8)
         $errors['password']   = 'Password must be at least 8 characters.';
     if ($password !== $passwordConfirm)
@@ -207,6 +228,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 // -- View -------------------------------------------------------
 $schoolLogo = school_setting('school_logo', '');
+
+// Load course caps and accepted counts for the current school year
+$regSchoolYear = school_setting('current_school_year', date('Y').'-'.(date('Y')+1));
+$fullCourses   = [];   // courses that have hit their cap
+try {
+    $capData = db()->prepare(
+        'SELECT cc.course_name, cc.max_slots,
+                COUNT(DISTINCT CASE WHEN r.result="accepted" THEN a.id END) AS accepted
+         FROM course_caps cc
+         LEFT JOIN applicants a      ON a.course_applied = cc.course_name AND a.school_year = cc.school_year
+         LEFT JOIN admission_results r ON r.applicant_id = a.id
+         WHERE cc.school_year = ? AND cc.max_slots IS NOT NULL
+         GROUP BY cc.course_name, cc.max_slots'
+    );
+    $capData->execute([$regSchoolYear]);
+    foreach ($capData->fetchAll() as $row) {
+        if ((int)$row['accepted'] >= (int)$row['max_slots']) {
+            $fullCourses[] = $row['course_name'];
+        }
+    }
+} catch (\Throwable $e) { /* table may not exist yet */ }
 ob_start();
 ?>
 <div class="auth-card animate-fade-in" style="max-width:560px">
@@ -283,15 +325,23 @@ ob_start();
                 class="form-select <?= isset($errors['course_applied']) ? 'error' : '' ?>" required
                 onchange="onCourseChange(this.value)">
                 <option value="">Select…</option>
-                <?php foreach (PLP_COURSES as $course): ?>
+                <?php foreach (PLP_COURSES as $course):
+                    $isFull = in_array($course, $fullCourses, true);
+                ?>
                     <option value="<?= e($course) ?>"
-                        <?= ($old['course_applied'] ?? '') === $course ? 'selected' : '' ?>>
-                        <?= e($course) ?>
+                        <?= ($old['course_applied'] ?? '') === $course ? 'selected' : '' ?>
+                        <?= $isFull ? 'disabled' : '' ?>>
+                        <?= e($course) ?><?= $isFull ? ' — FULL' : '' ?>
                     </option>
                 <?php endforeach; ?>
             </select>
             <?php if (!empty($errors['course_applied'])): ?>
                 <span class="form-error"><?= e($errors['course_applied']) ?></span>
+            <?php endif; ?>
+            <?php if (!empty($fullCourses)): ?>
+                <p style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:4px">
+                    Courses marked <strong>FULL</strong> have reached their enrollment cap for <?= e($regSchoolYear) ?> and are no longer accepting applications.
+                </p>
             <?php endif; ?>
         </div>
 

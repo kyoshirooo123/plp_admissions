@@ -140,6 +140,8 @@ CREATE TABLE `exam_results` (
     `exam_id`      INT(10) UNSIGNED NOT NULL,
     `score`        SMALLINT(6)      NOT NULL DEFAULT 0,
     `total_items`  SMALLINT(6)      NOT NULL DEFAULT 0,
+    `rank_score`   TINYINT(3)       NOT NULL DEFAULT 0 COMMENT '1–10 ranking based on percentage',
+    `passed`       TINYINT(1)       NOT NULL DEFAULT 0 COMMENT '1=passed threshold for applied course',
     `answers`      LONGTEXT         DEFAULT NULL COMMENT 'JSON array of chosen indices per question',
     `submitted_at` DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (`id`),
@@ -272,4 +274,150 @@ CREATE TABLE `audit_logs` (
     KEY `idx_user_id`    (`user_id`),
     KEY `idx_action`     (`action`),
     KEY `idx_created_at` (`created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- ============================================================
+-- PLP Admissions — Schema Additions (interview notes update)
+-- ============================================================
+
+-- ------------------------------------------------------------
+-- exam_slot_schedule
+-- Admin creates exam days + time slots. System auto-assigns
+-- applicants to slots (35 per room, 3 000 per day cap).
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `exam_slot_schedule` (
+    `id`          INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+    `exam_id`     INT(10) UNSIGNED DEFAULT NULL COMMENT 'FK to exams; NULL = any active exam',
+    `exam_date`   DATE             NOT NULL,
+    `slot_time`   TIME             NOT NULL DEFAULT '08:00:00',
+    `room_label`  VARCHAR(80)      NOT NULL DEFAULT '',
+    `capacity`    SMALLINT(5)      NOT NULL DEFAULT 35,
+    `filled`      SMALLINT(5)      NOT NULL DEFAULT 0,
+    `school_year` VARCHAR(9)       NOT NULL,
+    `created_by`  INT(10) UNSIGNED NOT NULL,
+    `created_at`  DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    KEY `idx_ess_date`   (`exam_date`),
+    KEY `idx_ess_year`   (`school_year`),
+    CONSTRAINT `fk_ess_exam`    FOREIGN KEY (`exam_id`)    REFERENCES `exams`  (`id`) ON DELETE SET NULL,
+    CONSTRAINT `fk_ess_creator` FOREIGN KEY (`created_by`) REFERENCES `users`  (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ------------------------------------------------------------
+-- applicant_exam_slots
+-- One-to-one: each applicant is auto-assigned one exam slot.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `applicant_exam_slots` (
+    `id`           INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+    `applicant_id` INT(10) UNSIGNED NOT NULL,
+    `slot_id`      INT(10) UNSIGNED NOT NULL,
+    `assigned_at`  DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_aes_applicant` (`applicant_id`),
+    KEY `idx_aes_slot` (`slot_id`),
+    CONSTRAINT `fk_aes_applicant` FOREIGN KEY (`applicant_id`) REFERENCES `applicants`         (`id`) ON DELETE CASCADE,
+    CONSTRAINT `fk_aes_slot`      FOREIGN KEY (`slot_id`)      REFERENCES `exam_slot_schedule` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ------------------------------------------------------------
+-- course_caps
+-- Admin sets max accepted applicants per course per year.
+-- NULL max_slots = unlimited.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `course_caps` (
+    `id`          INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+    `course_name` VARCHAR(200)     NOT NULL,
+    `school_year` VARCHAR(9)       NOT NULL,
+    `max_slots`   SMALLINT(5) UNSIGNED DEFAULT NULL COMMENT 'NULL = unlimited',
+    `updated_at`  DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_cc_course_year` (`course_name`, `school_year`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ------------------------------------------------------------
+-- course_passing_scores
+-- Per-course passing threshold (overrides the config default).
+-- Admin can update these from the settings panel.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `course_passing_scores` (
+    `id`          INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+    `course_name` VARCHAR(200)     NOT NULL,
+    `pass_from`   TINYINT(3)       NOT NULL DEFAULT 4 COMMENT 'Minimum score to pass (1-10)',
+    `confirmed`   TINYINT(1)       NOT NULL DEFAULT 0,
+    `updated_at`  DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_cps_course` (`course_name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ============================================================
+-- Seed: Exam & interview capacity settings
+-- ============================================================
+INSERT INTO `school_settings` (`setting_key`, `setting_value`) VALUES
+    ('exam_default_duration',  '90'),
+    ('exam_room_capacity',     '35'),
+    ('exam_daily_cap',         '3000'),
+    ('interview_daily_cap',    '45')
+ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value);
+
+-- ============================================================
+-- Seed: Default course passing scores (BSIT confirmed; rest TBD)
+-- ============================================================
+INSERT INTO `course_passing_scores` (`course_name`, `pass_from`, `confirmed`) VALUES
+    ('BS Accountancy (BSA)',                                               4, 0),
+    ('BS Business Administration major in Marketing Management (BSBA)',   4, 0),
+    ('BS Entrepreneurship (BSENT)',                                        4, 0),
+    ('BS Hospitality Management (BSHM)',                                   4, 0),
+    ('Bachelor of Elementary Education (BEED)',                            4, 0),
+    ('Bachelor of Secondary Education Major in English (BSED-ENG)',       4, 0),
+    ('Bachelor of Secondary Education Major in Filipino (BSED-FIL)',      4, 0),
+    ('Bachelor of Secondary Education Major in Mathematics (BSED-MATH)',  4, 0),
+    ('AB Psychology (AB Psych)',                                           4, 0),
+    ('BS Computer Science (BSCS)',                                         4, 0),
+    ('BS Information Technology (BSIT)',                                   4, 1),
+    ('BS Electronics Engineering (BSECE)',                                 4, 0),
+    ('BS Nursing (BSN)',                                                    4, 0)
+ON DUPLICATE KEY UPDATE pass_from=VALUES(pass_from), confirmed=VALUES(confirmed);
+
+-- ============================================================
+-- Migration: add rank_score + passed to existing exam_results
+-- Safe to run on existing installs (ALTER IGNORE / IF NOT EXISTS)
+-- ============================================================
+ALTER TABLE `exam_results`
+    ADD COLUMN IF NOT EXISTS `rank_score` TINYINT(3) NOT NULL DEFAULT 0 COMMENT '1–10 ranking based on percentage' AFTER `total_items`,
+    ADD COLUMN IF NOT EXISTS `passed`     TINYINT(1) NOT NULL DEFAULT 0 COMMENT '1=passed threshold for applied course' AFTER `rank_score`;
+
+-- ============================================================
+-- course_suggestions
+-- Records staff-recommended alternative courses for applicants
+-- who failed their chosen course exam threshold.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS `course_suggestions` (
+    `id`               INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+    `applicant_id`     INT(10) UNSIGNED NOT NULL,
+    `original_course`  VARCHAR(200)     NOT NULL,
+    `suggested_course` VARCHAR(200)     NOT NULL,
+    `suggested_by`     INT(10) UNSIGNED NOT NULL,
+    `note`             TEXT             DEFAULT NULL,
+    `status`           ENUM('pending','accepted','declined') NOT NULL DEFAULT 'pending',
+    `created_at`       DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`       DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_cs_applicant` (`applicant_id`),
+    KEY `idx_cs_status` (`status`),
+    CONSTRAINT `fk_cs_applicant`  FOREIGN KEY (`applicant_id`) REFERENCES `applicants` (`id`) ON DELETE CASCADE,
+    CONSTRAINT `fk_cs_staff`      FOREIGN KEY (`suggested_by`) REFERENCES `users`      (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ============================================================
+-- sessions
+-- DB-backed session store required for Vercel serverless
+-- (file sessions are not shared across containers).
+-- On localhost XAMPP, native file sessions are used instead
+-- and this table is not needed.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS `sessions` (
+    `id`            VARCHAR(128)    NOT NULL,
+    `payload`       MEDIUMTEXT      NOT NULL,
+    `last_activity` INT(10) UNSIGNED NOT NULL,
+    PRIMARY KEY (`id`),
+    KEY `idx_sessions_last_activity` (`last_activity`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

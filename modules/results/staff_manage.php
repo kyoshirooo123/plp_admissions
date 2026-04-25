@@ -36,6 +36,7 @@ $result = paginate(
     "SELECT a.*, u.name AS student_name, u.email,
             ar.result AS admission_result, ar.remarks AS admission_remarks, ar.released_at,
             er.score  AS exam_score, er.total_items AS exam_total,
+            er.rank_score AS exam_rank, er.passed AS exam_passed,
             iq.status AS interview_status, iq.interview_notes
      FROM applicants a
      JOIN users u ON u.id=a.user_id
@@ -109,13 +110,58 @@ ob_start();
                     <!-- Exam score -->
                     <td>
                         <?php if ($row['exam_score'] !== null): ?>
-                            <span style="font-weight:var(--weight-semibold);font-size:var(--text-sm)">
-                                <?= (int)$row['exam_score'] ?>
-                            </span>
-                            <?php if ($row['exam_total']): ?>
-                                <span style="color:var(--text-tertiary);font-size:var(--text-xs)">
-                                    / <?= (int)$row['exam_total'] ?>
-                                </span>
+                            <?php
+                                $rank     = $row['exam_rank'] > 0 ? (int)$row['exam_rank']
+                                            : score_to_rank((int)$row['exam_score'], (int)($row['exam_total'] ?: 1));
+                                $tierInfo = rank_tier_info($rank);
+                                $passed   = $row['exam_passed'] !== null
+                                            ? (bool)$row['exam_passed']
+                                            : exam_passed((int)$row['exam_score'], (int)($row['exam_total'] ?: 1), $row['course_applied']);
+                                $pct      = $row['exam_total'] > 0 ? round(($row['exam_score'] / $row['exam_total']) * 100) : 0;
+                            ?>
+                            <!-- Rank circle + raw score -->
+                            <div style="display:flex;align-items:center;gap:var(--space-2)">
+                                <div style="width:32px;height:32px;border-radius:50%;
+                                            background:<?= $tierInfo['bg'] ?>;
+                                            border:2px solid <?= $tierInfo['color'] ?>;
+                                            display:flex;align-items:center;justify-content:center;
+                                            font-weight:var(--weight-bold);font-size:var(--text-sm);
+                                            color:<?= $tierInfo['color'] ?>;
+                                            flex-shrink:0">
+                                    <?= $rank ?>
+                                </div>
+                                <div>
+                                    <div style="font-size:var(--text-xs);font-weight:var(--weight-medium)">
+                                        <?= (int)$row['exam_score'] ?>/<?= (int)$row['exam_total'] ?>
+                                        <span style="color:var(--text-tertiary)">(<?= $pct ?>%)</span>
+                                    </div>
+                                    <div style="display:flex;align-items:center;gap:4px;margin-top:2px">
+                                        <span style="font-size:10px;font-weight:var(--weight-semibold);
+                                                     color:<?= $tierInfo['color'] ?>"><?= $tierInfo['label'] ?></span>
+                                        <span style="font-size:10px;color:var(--text-tertiary)">·</span>
+                                        <?php if ($passed): ?>
+                                            <span style="font-size:10px;color:#22c55e;font-weight:var(--weight-semibold)">✓ Passed</span>
+                                        <?php else: ?>
+                                            <span style="font-size:10px;color:#ef4444;font-weight:var(--weight-semibold)">✗ Failed</span>
+                                        <?php endif; ?>
+                                    </div>
+                                </div>
+                            </div>
+                            <!-- Suggest button if failed -->
+                            <?php if (!$passed): ?>
+                                <?php $alts = suggest_alt_courses((int)$row['exam_score'], (int)($row['exam_total'] ?: 1), $row['course_applied']); ?>
+                                <?php if (!empty($alts)): ?>
+                                <button class="btn btn-ghost btn-sm" style="margin-top:var(--space-1);font-size:10px;padding:2px 8px;color:var(--warning)"
+                                        onclick="openSuggestModal(
+                                            <?= $row['id'] ?>,
+                                            <?= htmlspecialchars(json_encode($row['student_name']), ENT_QUOTES) ?>,
+                                            <?= htmlspecialchars(json_encode($alts), ENT_QUOTES) ?>,
+                                            <?= $rank ?>)">
+                                    💡 Suggest course
+                                </button>
+                                <?php else: ?>
+                                <div style="font-size:10px;color:var(--text-tertiary);margin-top:4px">No alt. courses available</div>
+                                <?php endif; ?>
                             <?php endif; ?>
                         <?php else: ?>
                             <span style="color:var(--text-tertiary);font-size:var(--text-sm)">—</span>
@@ -192,6 +238,43 @@ ob_start();
     </div>
 <?php endif; ?>
 
+<!-- Suggest course modal -->
+<div id="suggest-modal" class="modal-backdrop" style="display:none">
+    <div class="modal" style="max-width:460px">
+        <div class="modal-header">
+            <div class="modal-title">Suggest Alternative Course</div>
+            <button class="btn-icon" onclick="document.getElementById('suggest-modal').style.display='none'">
+                <?= icon('ic_fluent_dismiss_24_regular', 18) ?>
+            </button>
+        </div>
+        <form method="POST" id="suggest-form">
+            <?= csrf_field() ?>
+            <input type="hidden" name="action" value="suggest_course">
+            <div class="modal-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
+                <div style="background:var(--bg-subtle);border-radius:var(--radius-md);padding:var(--space-3) var(--space-4);font-size:var(--text-sm)">
+                    Applicant: <strong id="suggest-name"></strong><br>
+                    <span style="font-size:var(--text-xs);color:var(--text-tertiary)">
+                        Exam rank: <strong id="suggest-rank"></strong>/10 — did not pass applied course threshold.
+                    </span>
+                </div>
+                <div>
+                    <label class="form-label">Suggest a course where their score qualifies:</label>
+                    <div id="suggest-course-list" style="display:flex;flex-direction:column;gap:var(--space-2);margin-top:var(--space-2)"></div>
+                </div>
+                <div>
+                    <label class="form-label">Note for applicant (optional)</label>
+                    <textarea name="suggest_note" class="form-control" rows="2"
+                              placeholder="e.g. We recommend you consider this course based on your exam results…"></textarea>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-ghost" onclick="document.getElementById('suggest-modal').style.display='none'">Cancel</button>
+                <button type="submit" class="btn btn-primary">Send Suggestion</button>
+            </div>
+        </form>
+    </div>
+</div>
+
 <!-- Release modal -->
 <div id="release-modal" class="modal-backdrop" style="display:none">
     <div class="modal" style="max-width:420px">
@@ -236,6 +319,29 @@ function openReleaseModal(appId, name, currentResult, currentRemarks) {
     document.getElementById('release-modal').style.display = 'flex';
 }
 document.getElementById('release-modal').addEventListener('click', function(e){
+    if(e.target===this) this.style.display='none';
+});
+
+// ── Course suggestion modal ────────────────────────────────────
+function openSuggestModal(appId, name, alts, rank) {
+    const modal = document.getElementById('suggest-modal');
+    document.getElementById('suggest-name').textContent = name;
+    document.getElementById('suggest-rank').textContent = rank;
+    const list = document.getElementById('suggest-course-list');
+    list.innerHTML = '';
+    alts.forEach(function(course) {
+        const li = document.createElement('label');
+        li.style.cssText = 'display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-md);cursor:pointer;font-size:var(--text-sm)';
+        li.innerHTML = '<input type="radio" name="suggest_course" value="' + escHtml(course) + '" style="accent-color:var(--accent)"> ' + escHtml(course);
+        list.appendChild(li);
+    });
+    document.getElementById('suggest-form').action = '<?= url('/staff/results/suggest/') ?>' + appId;
+    modal.style.display = 'flex';
+}
+function escHtml(str) {
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+document.getElementById('suggest-modal').addEventListener('click', function(e){
     if(e.target===this) this.style.display='none';
 });
 </script>
