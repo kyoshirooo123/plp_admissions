@@ -117,11 +117,31 @@ switch ($action) {
     // Slot: close
     // ----------------------------------------------------------------
     case 'close_slot':
-        $db->prepare(
-            'UPDATE interview_slots SET status="closed" WHERE id=? AND created_by=?'
-        )->execute([$id, $staffId]);
-        audit_log('interview_slot_closed', "Closed interview slot ID {$id}", 'interview_slot', $id);
-        Session::flash('success', 'Session closed. Students can no longer book it.');
+        // Verify ownership (or admin) before touching anything.
+        $own = $db->prepare('SELECT created_by FROM interview_slots WHERE id = ?');
+        $own->execute([$id]);
+        $ownerId = (int)($own->fetchColumn() ?: 0);
+        $isAdmin = (Auth::user()['role'] ?? '') === ROLE_ADMIN;
+        if ($ownerId !== $staffId && !$isAdmin) {
+            Session::flash('error', 'You can only close your own sessions.');
+            redirect('/staff/interviews');
+        }
+
+        // Closing a slot means booked applicants need a new one —
+        // cancel_interview_slot() closes the slot AND auto-reschedules
+        // every 'scheduled' row into another open slot (same dept first).
+        try {
+            $rebooked = cancel_interview_slot($id, $staffId);
+            if ($rebooked > 0) {
+                Session::flash('success',
+                    "Session closed. {$rebooked} applicant(s) were automatically rescheduled.");
+            } else {
+                Session::flash('success', 'Session closed. Students can no longer book it.');
+            }
+        } catch (Throwable $e) {
+            error_log('close_slot failed: ' . $e->getMessage());
+            Session::flash('error', 'Could not close the session. Please try again.');
+        }
         redirect('/staff/interviews');
         break;
 

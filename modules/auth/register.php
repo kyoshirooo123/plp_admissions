@@ -164,11 +164,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo->beginTransaction();
 
         try {
+            $department = course_to_department($old['course_applied']);
+
             $stmt = $pdo->prepare(
                 'INSERT INTO users
                     (name, first_name, middle_name, last_name, suffix,
-                     birthdate, sex, address, phone, email, password_hash, role)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                     birthdate, sex, address, phone, email, password_hash, role, department)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
             );
             $stmt->execute([
                 $displayName,
@@ -183,6 +185,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $old['email'],
                 password_hash($password, PASSWORD_BCRYPT, ['cost' => 12]),
                 ROLE_STUDENT,
+                $department,
             ]);
             $userId = (int) $pdo->lastInsertId();
 
@@ -210,6 +213,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $pdo->commit();
+
+            // Log the department assignment so auditors can trace
+            // course → college decisions after the fact.
+            if ($department !== '') {
+                audit_log(
+                    'user_department_assigned',
+                    "Registered user #{$userId} assigned to {$department} from course '" . $old['course_applied'] . "'",
+                    'user',
+                    $userId
+                );
+            }
 
             $user = $pdo->prepare('SELECT * FROM users WHERE id = ? LIMIT 1');
             $user->execute([$userId]);
