@@ -467,25 +467,20 @@ CREATE TABLE IF NOT EXISTS `course_departments` (
         ON UPDATE CASCADE ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-INSERT INTO `course_departments` (`course_name`, `department_id`)
-SELECT c.course_name, d.id
-FROM departments d
-JOIN (
-    SELECT 'BS Information Technology (BSIT)'                                  AS course_name, 'CCS' AS code UNION ALL
-    SELECT 'BS Computer Science (BSCS)',                                             'CCS' UNION ALL
-    SELECT 'BS Nursing (BSN)',                                                       'CON' UNION ALL
-    SELECT 'BS Accountancy (BSA)',                                                   'CBA' UNION ALL
-    SELECT 'BS Business Administration major in Marketing Management (BSBA)',       'CBA' UNION ALL
-    SELECT 'BS Entrepreneurship (BSENT)',                                            'CBA' UNION ALL
-    SELECT 'BS Hospitality Management (BSHM)',                                       'CBA' UNION ALL
-    SELECT 'Bachelor of Elementary Education (BEED)',                                'COE' UNION ALL
-    SELECT 'Bachelor of Secondary Education Major in English (BSED-ENG)',           'COE' UNION ALL
-    SELECT 'Bachelor of Secondary Education Major in Filipino (BSED-FIL)',          'COE' UNION ALL
-    SELECT 'Bachelor of Secondary Education Major in Mathematics (BSED-MATH)',      'COE' UNION ALL
-    SELECT 'AB Psychology (AB Psych)',                                               'CAS' UNION ALL
-    SELECT 'BS Electronics Engineering (BSECE)',                                     'CEN'
-) c ON c.code = d.code
-ON DUPLICATE KEY UPDATE department_id = VALUES(department_id);
+INSERT IGNORE INTO `course_departments` (`course_name`, `department_id`) VALUES
+    ('BS Information Technology (BSIT)',                                       (SELECT id FROM departments WHERE code = 'CCS')),
+    ('BS Computer Science (BSCS)',                                             (SELECT id FROM departments WHERE code = 'CCS')),
+    ('BS Nursing (BSN)',                                                       (SELECT id FROM departments WHERE code = 'CON')),
+    ('BS Accountancy (BSA)',                                                   (SELECT id FROM departments WHERE code = 'CBA')),
+    ('BS Business Administration major in Marketing Management (BSBA)',        (SELECT id FROM departments WHERE code = 'CBA')),
+    ('BS Entrepreneurship (BSENT)',                                            (SELECT id FROM departments WHERE code = 'CBA')),
+    ('BS Hospitality Management (BSHM)',                                       (SELECT id FROM departments WHERE code = 'CBA')),
+    ('Bachelor of Elementary Education (BEED)',                                (SELECT id FROM departments WHERE code = 'COE')),
+    ('Bachelor of Secondary Education Major in English (BSED-ENG)',            (SELECT id FROM departments WHERE code = 'COE')),
+    ('Bachelor of Secondary Education Major in Filipino (BSED-FIL)',           (SELECT id FROM departments WHERE code = 'COE')),
+    ('Bachelor of Secondary Education Major in Mathematics (BSED-MATH)',       (SELECT id FROM departments WHERE code = 'COE')),
+    ('AB Psychology (AB Psych)',                                               (SELECT id FROM departments WHERE code = 'CAS')),
+    ('BS Electronics Engineering (BSECE)',                                     (SELECT id FROM departments WHERE code = 'CEN'));
 
 CREATE TABLE IF NOT EXISTS `department_schedules` (
     `id`                INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -506,12 +501,12 @@ CREATE TABLE IF NOT EXISTS `department_schedules` (
         ON UPDATE CASCADE ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-INSERT INTO `department_schedules`
+-- Seed Mon–Fri 09:00-16:00 windows for every department.  INSERT IGNORE
+-- is portable across MariaDB/MySQL and skips rows that would violate
+-- the (department_id, day_of_week, start_time) uniqueness.
+INSERT IGNORE INTO `department_schedules`
     (`department_id`, `day_of_week`, `start_time`, `end_time`, `slot_minutes`, `capacity_per_slot`)
-SELECT d.id, dow.day_of_week, '09:00:00', '16:00:00', 30, 1
-FROM departments d
-CROSS JOIN (
-    SELECT 1 AS day_of_week UNION ALL
-    SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
-) dow
-ON DUPLICATE KEY UPDATE start_time = VALUES(start_time);
+SELECT d.id, v.dow, '09:00:00', '16:00:00', 30, 1
+FROM `departments` d,
+     (SELECT 1 AS dow UNION ALL SELECT 2 UNION ALL SELECT 3
+      UNION ALL SELECT 4 UNION ALL SELECT 5) v;
