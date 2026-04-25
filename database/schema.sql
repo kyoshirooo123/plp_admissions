@@ -24,13 +24,15 @@ CREATE TABLE `users` (
     `email`         VARCHAR(180)     NOT NULL,
     `password_hash` VARCHAR(255)     NOT NULL,
     `role`          ENUM('student','staff','admin') NOT NULL DEFAULT 'student',
+    `department`    VARCHAR(120)     NOT NULL DEFAULT '' COMMENT 'College/department name (see departments.name)',
     `is_active`     TINYINT(1)       NOT NULL DEFAULT 1,
     `desk_label`    VARCHAR(120)     NOT NULL DEFAULT '',
     `desk_notes`    TEXT             DEFAULT NULL,
     `created_at`    DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
     `updated_at`    DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (`id`),
-    UNIQUE KEY `uq_email` (`email`)
+    UNIQUE KEY `uq_email` (`email`),
+    KEY `idx_users_department` (`department`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ------------------------------------------------------------
@@ -160,12 +162,14 @@ CREATE TABLE `interview_slots` (
     `slot_time`   TIME             DEFAULT NULL,
     `end_time`    TIME             DEFAULT NULL,
     `capacity`    SMALLINT(5)      NOT NULL DEFAULT 30,
+    `department`  VARCHAR(120)     NOT NULL DEFAULT '' COMMENT 'College this slot serves (see departments.name)',
     `status`      ENUM('open','closed') NOT NULL DEFAULT 'open',
     `created_by`  INT(10) UNSIGNED NOT NULL,
     `created_at`  DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (`id`),
-    KEY `idx_slot_date`  (`slot_date`),
-    KEY `idx_created_by` (`created_by`),
+    KEY `idx_slot_date`   (`slot_date`),
+    KEY `idx_created_by`  (`created_by`),
+    KEY `idx_slots_department` (`department`),
     CONSTRAINT `fk_slots_creator` FOREIGN KEY (`created_by`) REFERENCES `users` (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -421,3 +425,93 @@ CREATE TABLE IF NOT EXISTS `sessions` (
     PRIMARY KEY (`id`),
     KEY `idx_sessions_last_activity` (`last_activity`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ============================================================
+-- Departments + course→department mapping + department schedules
+-- Backing tables for auto interview-slot assignment.
+-- See database/migrations/2026_04_25_interview_auto_scheduling.sql
+-- for the ALTERs/backfills against pre-existing databases.
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS `departments` (
+    `id`         INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+    `code`       VARCHAR(20)      NOT NULL,
+    `name`       VARCHAR(120)     NOT NULL,
+    `created_at` DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_dept_code` (`code`),
+    UNIQUE KEY `uq_dept_name` (`name`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO `departments` (`code`, `name`) VALUES
+    ('CCS', 'College of Computer Studies'),
+    ('CON', 'College of Nursing'),
+    ('CBA', 'College of Business and Accountancy'),
+    ('COE', 'College of Education'),
+    ('CAS', 'College of Arts and Sciences'),
+    ('CEN', 'College of Engineering')
+ON DUPLICATE KEY UPDATE name = VALUES(name);
+
+CREATE TABLE IF NOT EXISTS `course_departments` (
+    `id`            INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+    `course_name`   VARCHAR(200)     NOT NULL,
+    `department_id` INT(10) UNSIGNED NOT NULL,
+    `created_at`    DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`    DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_cd_course` (`course_name`),
+    KEY `idx_cd_department` (`department_id`),
+    CONSTRAINT `fk_cd_department`
+        FOREIGN KEY (`department_id`) REFERENCES `departments` (`id`)
+        ON UPDATE CASCADE ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO `course_departments` (`course_name`, `department_id`)
+SELECT c.course_name, d.id
+FROM departments d
+JOIN (
+    SELECT 'BS Information Technology (BSIT)'                                  AS course_name, 'CCS' AS code UNION ALL
+    SELECT 'BS Computer Science (BSCS)',                                             'CCS' UNION ALL
+    SELECT 'BS Nursing (BSN)',                                                       'CON' UNION ALL
+    SELECT 'BS Accountancy (BSA)',                                                   'CBA' UNION ALL
+    SELECT 'BS Business Administration major in Marketing Management (BSBA)',       'CBA' UNION ALL
+    SELECT 'BS Entrepreneurship (BSENT)',                                            'CBA' UNION ALL
+    SELECT 'BS Hospitality Management (BSHM)',                                       'CBA' UNION ALL
+    SELECT 'Bachelor of Elementary Education (BEED)',                                'COE' UNION ALL
+    SELECT 'Bachelor of Secondary Education Major in English (BSED-ENG)',           'COE' UNION ALL
+    SELECT 'Bachelor of Secondary Education Major in Filipino (BSED-FIL)',          'COE' UNION ALL
+    SELECT 'Bachelor of Secondary Education Major in Mathematics (BSED-MATH)',      'COE' UNION ALL
+    SELECT 'AB Psychology (AB Psych)',                                               'CAS' UNION ALL
+    SELECT 'BS Electronics Engineering (BSECE)',                                     'CEN'
+) c ON c.code = d.code
+ON DUPLICATE KEY UPDATE department_id = VALUES(department_id);
+
+CREATE TABLE IF NOT EXISTS `department_schedules` (
+    `id`                INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+    `department_id`     INT(10) UNSIGNED NOT NULL,
+    `day_of_week`       TINYINT(1) UNSIGNED NOT NULL COMMENT '0=Sun..6=Sat',
+    `start_time`        TIME             NOT NULL DEFAULT '09:00:00',
+    `end_time`          TIME             NOT NULL DEFAULT '16:00:00',
+    `slot_minutes`      SMALLINT(5) UNSIGNED NOT NULL DEFAULT 30,
+    `capacity_per_slot` SMALLINT(5) UNSIGNED NOT NULL DEFAULT 1,
+    `is_active`         TINYINT(1)       NOT NULL DEFAULT 1,
+    `created_at`        DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`        DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_ds_dept_dow_start` (`department_id`, `day_of_week`, `start_time`),
+    KEY `idx_ds_department` (`department_id`),
+    CONSTRAINT `fk_ds_department`
+        FOREIGN KEY (`department_id`) REFERENCES `departments` (`id`)
+        ON UPDATE CASCADE ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO `department_schedules`
+    (`department_id`, `day_of_week`, `start_time`, `end_time`, `slot_minutes`, `capacity_per_slot`)
+SELECT d.id, dow.day_of_week, '09:00:00', '16:00:00', 30, 1
+FROM departments d
+CROSS JOIN (
+    SELECT 1 AS day_of_week UNION ALL
+    SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5
+) dow
+ON DUPLICATE KEY UPDATE start_time = VALUES(start_time);

@@ -104,6 +104,42 @@ define('PLP_COURSES', [
     'BS Nursing (BSN)',
 ]);
 
+// -- Departments / Colleges -------------------------------------
+// Keep the canonical name in sync with `departments.name` (DB).
+define('DEPT_CCS', 'College of Computer Studies');
+define('DEPT_CON', 'College of Nursing');
+define('DEPT_CBA', 'College of Business and Accountancy');
+define('DEPT_COE', 'College of Education');
+define('DEPT_CAS', 'College of Arts and Sciences');
+define('DEPT_CEN', 'College of Engineering');
+
+define('PLP_DEPARTMENTS', [
+    DEPT_CCS,
+    DEPT_CON,
+    DEPT_CBA,
+    DEPT_COE,
+    DEPT_CAS,
+    DEPT_CEN,
+]);
+
+// Course → department mapping.  This is the config-level fallback;
+// the `course_departments` DB table is the source of truth once seeded.
+define('COURSE_DEPARTMENT_MAP', [
+    'BS Information Technology (BSIT)'                                  => DEPT_CCS,
+    'BS Computer Science (BSCS)'                                        => DEPT_CCS,
+    'BS Nursing (BSN)'                                                  => DEPT_CON,
+    'BS Accountancy (BSA)'                                              => DEPT_CBA,
+    'BS Business Administration major in Marketing Management (BSBA)'   => DEPT_CBA,
+    'BS Entrepreneurship (BSENT)'                                       => DEPT_CBA,
+    'BS Hospitality Management (BSHM)'                                  => DEPT_CBA,
+    'Bachelor of Elementary Education (BEED)'                           => DEPT_COE,
+    'Bachelor of Secondary Education Major in English (BSED-ENG)'       => DEPT_COE,
+    'Bachelor of Secondary Education Major in Filipino (BSED-FIL)'      => DEPT_COE,
+    'Bachelor of Secondary Education Major in Mathematics (BSED-MATH)'  => DEPT_COE,
+    'AB Psychology (AB Psych)'                                          => DEPT_CAS,
+    'BS Electronics Engineering (BSECE)'                                => DEPT_CEN,
+]);
+
 // -- Strand requirements per course (freshmen only) --------------
 // Applicants should apply only to courses where their SHS strand is applicable.
 define('COURSE_STRAND_MAP', [

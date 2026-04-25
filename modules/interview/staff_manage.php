@@ -33,10 +33,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($action === 'create_slot') {
-        $date    = trim($_POST['slot_date']     ?? '');
-        $time    = trim($_POST['slot_time']     ?? '') ?: null;
-        $endTime = trim($_POST['slot_end_time'] ?? '') ?: null;
+        $date     = trim($_POST['slot_date']     ?? '');
+        $time     = trim($_POST['slot_time']     ?? '') ?: null;
+        $endTime  = trim($_POST['slot_end_time'] ?? '') ?: null;
         $capacity = max(1, (int)($_POST['capacity'] ?? 30));
+
+        // Department defaults to the staff's own department.  Admins (or
+        // cross-department staff) may override via a dropdown.
+        $slotDept = trim($_POST['department'] ?? '');
+        if ($slotDept === '') {
+            $slotDept = user_department($staffId);
+        } elseif (!in_array($slotDept, departments_list(), true)) {
+            $errors[] = 'Invalid department selected.';
+        }
 
         if (!$date) {
             $errors[] = 'Please select a date.';
@@ -44,18 +53,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $errors[] = 'Date cannot be in the past.';
         } elseif ($time && $endTime && $endTime <= $time) {
             $errors[] = 'End time must be after the start time.';
-        } else {
+        } elseif (empty($errors)) {
             try {
                 $db->prepare(
-                    'INSERT INTO interview_slots (slot_date, slot_time, end_time, capacity, created_by)
-                     VALUES (?, ?, ?, ?, ?)'
-                )->execute([$date, $time, $endTime, $capacity, $staffId]);
+                    'INSERT INTO interview_slots
+                        (slot_date, slot_time, end_time, capacity, department, created_by)
+                     VALUES (?, ?, ?, ?, ?, ?)'
+                )->execute([$date, $time, $endTime, $capacity, $slotDept, $staffId]);
+                $newSlotId = (int)$db->lastInsertId();
+                audit_log(
+                    'interview_slot_created',
+                    "Created slot #{$newSlotId} on {$date} for "
+                        . ($slotDept !== '' ? $slotDept : 'any department'),
+                    'interview_slot',
+                    $newSlotId
+                );
                 $success[] = 'Session added for ' . format_date($date) . '.';
             } catch (PDOException) {
                 $errors[] = 'Could not create session. Please try again.';
             }
         }
     }
+
 }
 
 // ----------------------------------------------------------------
@@ -402,6 +421,25 @@ ob_start();
                            value="<?= INTERVIEW_DAILY_CAP ?>" min="1" max="500" required>
                     <p style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:var(--space-1)">
                         Recommended: 40–50 per day. Admin-configured max: <?= (int) school_setting('interview_daily_cap', INTERVIEW_DAILY_CAP) ?>.
+                    </p>
+                </div>
+
+                <div>
+                    <label class="form-label">
+                        Department / College
+                        <span style="color:var(--text-tertiary);font-weight:400"> — auto-assignment target</span>
+                    </label>
+                    <?php $myDept = user_department($staffId); ?>
+                    <select name="department" class="form-control">
+                        <option value="">Use my department (<?= e($myDept ?: 'any') ?>)</option>
+                        <?php foreach (departments_list() as $deptName): ?>
+                            <option value="<?= e($deptName) ?>" <?= $deptName === $myDept ? 'selected' : '' ?>>
+                                <?= e($deptName) ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                    <p style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:var(--space-1)">
+                        The auto-scheduler will only assign applicants from this college to the slot.
                     </p>
                 </div>
 

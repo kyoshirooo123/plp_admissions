@@ -57,6 +57,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     csrf_check();
     $action = $_POST['action'] ?? 'book';
 
+    // ---- Auto-assign: let the system pick a slot ---------------
+    if ($action === 'auto_assign') {
+        if ($myEntry) { redirect('/student/interview'); }
+        try {
+            $assignedSlotId = assign_interview_slot($applicantId, $userId);
+            if ($assignedSlotId) {
+                Session::flash('success', 'We\'ve automatically reserved the best available interview slot for you.');
+                redirect('/student/interview');
+            } else {
+                $errors[] = 'No interview slots are currently available for your department. Please check back shortly.';
+            }
+        } catch (Throwable $e) {
+            error_log('auto_assign failed: ' . $e->getMessage());
+            $errors[] = 'Automatic assignment failed. Please try again or pick a slot manually below.';
+        }
+    }
+
     // ---- Book a session ----------------------------------------
     if ($action === 'book') {
         if ($myEntry) { redirect('/student/interview'); }
@@ -155,9 +172,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 // ----------------------------------------------------------------
 // Load available sessions (if student has no booking)
 // ----------------------------------------------------------------
-$openSessions = [];
+$openSessions    = [];
+$studentDept     = user_department($userId) ?: course_to_department($applicant['course_applied']);
 if (!$myEntry) {
     $nowTime = date('H:i:s');
+    // Scope to the student's department when we have one; otherwise
+    // fall back to the legacy behaviour (any slot).
+    $params  = [$today, $today, $nowTime];
+    $deptSql = '';
+    if ($studentDept !== '') {
+        $deptSql  = ' AND (s.department = ? OR s.department = "")';
+        $params[] = $studentDept;
+    }
     $stmt = $db->prepare(
         'SELECT s.*,
                 u.name       AS staff_name,
@@ -168,12 +194,13 @@ if (!$myEntry) {
          JOIN   users u ON u.id = s.created_by
          LEFT JOIN interview_queue q ON q.slot_id = s.id
          WHERE  s.slot_date >= ? AND s.status = "open"
-           AND  NOT (s.slot_date = ? AND s.end_time IS NOT NULL AND s.end_time <= ?)
+           AND  NOT (s.slot_date = ? AND s.end_time IS NOT NULL AND s.end_time <= ?)'
+         . $deptSql . '
          GROUP BY s.id
          HAVING booked < s.capacity
          ORDER BY s.slot_date ASC, s.slot_time ASC'
     );
-    $stmt->execute([$today, $today, $nowTime]);
+    $stmt->execute($params);
     $openSessions = $stmt->fetchAll();
 }
 
@@ -417,8 +444,35 @@ ob_start();
 
 <?php else: ?>
     <!-- ============================================================
-         NO BOOKING — Show available sessions
+         NO BOOKING — Auto-assign + manual pick
     ============================================================ -->
+
+    <!-- Auto-assign card (always shown when user has no booking) -->
+    <div class="card" style="padding:var(--space-5);margin-bottom:var(--space-4)">
+        <div style="display:flex;align-items:center;gap:var(--space-4);flex-wrap:wrap">
+            <div style="flex:1;min-width:0">
+                <div style="font-weight:var(--weight-semibold);margin-bottom:var(--space-1)">
+                    Let us schedule your interview
+                </div>
+                <div style="font-size:var(--text-sm);color:var(--text-tertiary)">
+                    We'll pick the next available slot
+                    <?php if ($studentDept !== ''): ?>
+                        for <strong><?= e($studentDept) ?></strong>
+                    <?php endif; ?>
+                    — the least-booked session to keep things fair.
+                </div>
+            </div>
+            <form method="POST">
+                <?= csrf_field() ?>
+                <input type="hidden" name="action" value="auto_assign">
+                <button type="submit" class="btn btn-primary"
+                    <?= empty($openSessions) ? 'disabled' : '' ?>>
+                    Auto-assign my slot
+                </button>
+            </form>
+        </div>
+    </div>
+
     <?php if (empty($openSessions)): ?>
         <div class="card" style="padding:var(--space-6);text-align:center">
             <div style="color:var(--text-tertiary);font-size:var(--text-sm)">
@@ -429,10 +483,10 @@ ob_start();
     <?php else: ?>
         <div style="margin-bottom:var(--space-4)">
             <div style="font-weight:var(--weight-semibold);margin-bottom:var(--space-1)">
-                Available Interview Sessions
+                Or pick a specific session
             </div>
             <div style="font-size:var(--text-sm);color:var(--text-tertiary)">
-                Select a session to book your interview slot.
+                Prefer a particular date or time? Choose below.
             </div>
         </div>
 
