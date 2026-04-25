@@ -68,7 +68,24 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     'interview_slot',
                     $newSlotId
                 );
-                $success[] = 'Session added for ' . format_date($date) . '.';
+
+                // Auto-assign pending applicants to the new (and any
+                // other open) department slot(s).  Students never book
+                // their own slot — this is how assignment happens.
+                $assigned = 0;
+                try {
+                    $assigned = bulk_assign_pending_applicants(
+                        $slotDept !== '' ? $slotDept : null,
+                        $staffId
+                    );
+                } catch (Throwable $e) {
+                    error_log('bulk_assign after create_slot failed: ' . $e->getMessage());
+                }
+
+                $success[] = 'Session added for ' . format_date($date) . '.'
+                    . ($assigned > 0
+                        ? " {$assigned} pending applicant(s) were automatically assigned."
+                        : '');
             } catch (PDOException) {
                 $errors[] = 'Could not create session. Please try again.';
             }
@@ -182,9 +199,14 @@ ob_start();
         </a>
         <a href="?past=1"
            style="padding:var(--space-2) var(--space-4);font-size:var(--text-sm);
-                  text-decoration:none;
+                  text-decoration:none;border-right:1px solid var(--border);
                   <?= $showPast ? 'background:var(--bg-subtle);color:var(--text-primary);font-weight:var(--weight-medium)' : 'color:var(--text-secondary)' ?>">
             Past
+        </a>
+        <a href="<?= url('/staff/interviews/absent') ?>"
+           style="padding:var(--space-2) var(--space-4);font-size:var(--text-sm);
+                  text-decoration:none;color:var(--text-secondary)">
+            Absent
         </a>
     </div>
 
@@ -339,6 +361,11 @@ ob_start();
 
                     <!-- Actions -->
                     <div style="display:flex;align-items:center;gap:var(--space-1)">
+
+                        <a href="<?= url('/staff/interviews/' . $slot['id'] . '/roster') ?>"
+                           class="btn btn-ghost btn-sm">
+                            Roster (<?= $booked ?>)
+                        </a>
 
                         <?php if (!$isExpired): ?>
                         <form method="POST" action="<?= url('/staff/interviews/' . $slot['id']) ?>">

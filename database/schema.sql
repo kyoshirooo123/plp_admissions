@@ -177,20 +177,52 @@ CREATE TABLE `interview_slots` (
 -- interview_queue  (one row per student per session)
 -- ------------------------------------------------------------
 CREATE TABLE `interview_queue` (
-    `id`              INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
-    `slot_id`         INT(10) UNSIGNED NOT NULL,
-    `applicant_id`    INT(10) UNSIGNED NOT NULL,
-    `queue_number`    INT UNSIGNED     DEFAULT NULL,
-    `status`          ENUM('scheduled','checked_in','in_progress','completed','no_show') NOT NULL DEFAULT 'scheduled',
-    `checked_in_at`   DATETIME         DEFAULT NULL,
-    `interview_notes` TEXT             DEFAULT NULL,
-    `created_at`      DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    `id`                INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+    `slot_id`           INT(10) UNSIGNED NOT NULL,
+    `applicant_id`      INT(10) UNSIGNED NOT NULL,
+    `queue_number`      INT UNSIGNED     DEFAULT NULL,
+    `status`            ENUM('scheduled','checked_in','in_progress','completed','no_show') NOT NULL DEFAULT 'scheduled',
+    `checked_in_at`     DATETIME         DEFAULT NULL,
+    `interview_notes`   TEXT             DEFAULT NULL,
+    `attendance_status` ENUM('present','absent') NULL DEFAULT NULL COMMENT 'Filled in by staff at interview time',
+    `evaluation_result` ENUM('pass','fail')      NULL DEFAULT NULL COMMENT 'Only meaningful when attendance_status = present',
+    `interview_status`  ENUM('pending','completed','absent','rescheduled') NOT NULL DEFAULT 'pending' COMMENT 'End-to-end lifecycle state',
+    `evaluated_by`      INT(10) UNSIGNED NULL DEFAULT NULL,
+    `evaluated_at`      DATETIME         NULL DEFAULT NULL,
+    `created_at`        DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (`id`),
     UNIQUE KEY `uq_applicant_active` (`applicant_id`),
-    KEY `idx_iq_applicant` (`applicant_id`),
-    KEY `idx_iq_slot`      (`slot_id`),
+    KEY `idx_iq_applicant`        (`applicant_id`),
+    KEY `idx_iq_slot`             (`slot_id`),
+    KEY `idx_iq_interview_status` (`interview_status`),
+    KEY `idx_iq_attendance`       (`attendance_status`),
     CONSTRAINT `fk_iq_slot`      FOREIGN KEY (`slot_id`)      REFERENCES `interview_slots` (`id`) ON DELETE CASCADE,
     CONSTRAINT `fk_iq_applicant` FOREIGN KEY (`applicant_id`) REFERENCES `applicants`       (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- ------------------------------------------------------------
+-- reschedule_logs — append-only history of reschedule actions
+-- ------------------------------------------------------------
+CREATE TABLE `reschedule_logs` (
+    `id`             INT(10) UNSIGNED NOT NULL AUTO_INCREMENT,
+    `applicant_id`   INT(10) UNSIGNED NOT NULL,
+    `from_slot_id`   INT(10) UNSIGNED NULL,
+    `to_slot_id`     INT(10) UNSIGNED NULL,
+    `from_slot_date` DATE             NULL,
+    `from_slot_time` TIME             NULL,
+    `reason`         VARCHAR(255)     NOT NULL DEFAULT 'absent',
+    `rescheduled_by` INT(10) UNSIGNED NULL,
+    `rescheduled_at` DATETIME         NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    KEY `idx_rl_applicant` (`applicant_id`),
+    KEY `idx_rl_from_slot` (`from_slot_id`),
+    KEY `idx_rl_to_slot`   (`to_slot_id`),
+    CONSTRAINT `fk_rl_applicant`
+        FOREIGN KEY (`applicant_id`) REFERENCES `applicants` (`id`) ON DELETE CASCADE,
+    CONSTRAINT `fk_rl_from_slot`
+        FOREIGN KEY (`from_slot_id`) REFERENCES `interview_slots` (`id`) ON DELETE SET NULL,
+    CONSTRAINT `fk_rl_to_slot`
+        FOREIGN KEY (`to_slot_id`)   REFERENCES `interview_slots` (`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ------------------------------------------------------------
