@@ -1,487 +1,544 @@
-# PLP Admissions System — Full Flow & Reference
-
-> Verified against the code on `baseline` (post-zip-merge, post-demo-seed-fix). When something in the code disagrees with this document, the **code is the source of truth** — please open a PR to update this file.
+# PLP Admissions System — Full Analysis
 
 ## Table of Contents
 
 1. [System Overview](#1-system-overview)
-2. [Roles & Access](#2-roles--access)
-3. [The Admissions Pipeline (end to end)](#3-the-admissions-pipeline-end-to-end)
-4. [Automations Cheat-Sheet](#4-automations-cheat-sheet)
-5. [Department Scoping (who sees whom)](#5-department-scoping-who-sees-whom)
-6. [Edge Cases & Business Rules](#6-edge-cases--business-rules)
-7. [Frequently Asked Questions](#7-frequently-asked-questions)
-8. [Known Gaps & Risks](#8-known-gaps--risks)
-9. [Codebase Map](#9-codebase-map)
+2. [Complete Workflow (Chronological)](#2-complete-workflow-chronological)
+3. [What the System Automates](#3-what-the-system-automates)
+4. [Special Situations & Edge Cases](#4-special-situations--edge-cases)
+5. [Hard-Hitting Client Questions & Answers](#5-hard-hitting-client-questions--answers)
+6. [Unaddressed Problems & Risks](#6-unaddressed-problems--risks)
+7. [File-by-File Reference](#7-file-by-file-reference)
 
 ---
 
 ## 1. System Overview
 
-PLP Admissions is a vanilla-PHP web app for **Pamantasan ng Lungsod ng Pasig** that runs the entire student admissions cycle — registration → email verification → document review → entrance exam → interview → admission decision → enrollment intent.
+The PLP Admissions System is a web application for **Pamantasan ng Lungsod ng Pasig** that manages the entire student admissions pipeline — from application through enrollment. It supports three user roles: **Student**, **Staff**, and **Admin**.
 
-**Stack:** PHP 8 (no framework), MySQL/MariaDB (utf8mb4), vanilla CSS/JS, PHPMailer (SMTP), hCaptcha (anti-bot), Chart.js for dashboards, Puter AI as a browser-side fallback for document validation.
+**Tech Stack:** PHP (no framework), MySQL/MariaDB, vanilla CSS/JS, hCaptcha (bot protection).
 
-**Architecture:** One entry point (`public/index.php`) routes every request through a hand-rolled `Router`. Each feature lives in `modules/<area>/` and renders into a shared layout via `ob_start()` / `ob_get_clean()`. Cross-cutting logic (auth, automation, the interview scheduler) lives in `core/`.
+**Architecture:** Single entry point (`public/index.php`) routes all requests through a custom `Router` class. The system uses a module-based layout where each feature lives in `modules/`. Views use `ob_start()` / `ob_get_clean()` output buffering with layout includes.
 
----
+### Roles & Access
 
-## 2. Roles & Access
-
-The seed_users.sql script provisions five role tiers. `Auth::homeUrl()` in `core/Auth.php` decides where each role lands after login.
-
-| Role           | Default landing page    | What they do |
-|----------------|-------------------------|--------------|
-| **Admin**      | `/admin/dashboard`      | System-wide oversight: users, school year window, courses & caps, branding, settings, audit log, all reports |
-| **SSO**        | `/admin/dashboard`      | Office of Student Services. Reviews documents, runs the global doc queue, bulk-releases results, exports |
-| **Dean**       | `/admin/dashboard`      | Per-college oversight: sees all applicants in their college, can edit course caps for their college, can release results for their applicants |
-| **Staff** (Professor) | `/staff/dashboard` | Per-college interviewer. Creates interview sessions, runs their own live queue, evaluates assigned applicants |
-| **Student**    | `/student/documents`    | Applicant. Uploads documents, takes the exam, sees their interview slot, confirms enrollment |
-
-The seeded passwords (from `database/seed_users.sql`) are `Admin@123`, `SSO@123`, `Dean@123`, `Staff@123`. **Change them before going to production.**
+| Role | Access |
+|------|--------|
+| **Student** | Register, upload documents, take exam, view interview schedule, check-in, view results, withdraw |
+| **Staff** | Review documents, manage exams/questions, manage interview slots/queue, release results, suggest courses |
+| **Admin** | Everything staff can do + manage users, school year settings, courses/strands, branding, audit logs |
 
 ---
 
-## 3. The Admissions Pipeline (end to end)
+## 2. Complete Workflow (Chronological)
 
-Every applicant moves through a single column on the `applicants` table: `overall_status`. The values, in order, are:
+### Phase 0: Admin Setup (Before Admissions Open)
 
-```
-pending → documents → submitted → exam → interview → released
-                                                       ↘ withdrawn (terminal)
-```
+1. **Admin sets the Admissions Window** (`admin_school_year.php`)
+   - Configures open date, close date, and optional document submission deadline
+   - School year is auto-derived from the open date (e.g., open in 2026 → AY 2026-2027)
 
-Below is what triggers each transition.
+2. **Admin configures Courses & Tiers** (`admin_courses.php`)
+   - Sets tier thresholds per course (High/Average/Low score bands)
+   - Sets enrollment caps (max accepted students per course)
+   - Can add custom courses beyond the 13 built-in PLP programs
+   - Maps courses to SHS strands (which strand graduates can apply to which course)
 
-### Phase 0 — Admin / Staff configuration (before admissions open)
+3. **Admin creates Staff accounts** (`admin_users.php`)
+   - Assigns department to each staff member
+   - Staff can only manage interviews for their assigned department
 
-These steps happen once per cycle. None of them touch student data.
+4. **Staff builds the Entrance Exam** (`staff_manage.php`)
+   - Creates an exam with title, scheduled date/time, and access password
+   - Adds sections with different question types (multiple choice, checkboxes, dropdown, short answer, paragraph, linear scale)
+   - Sections have titles and descriptions/instructions
+   - Supports question/choice shuffling
 
-1. **Admin opens the admissions window** (`/admin/school-year`)
-   - Sets the open date, close date, and optional document submission deadline.
-   - The current school year is auto-derived (e.g. opening in 2026 → `2026-2027`).
-   - Outside this window, `/register` is blocked with a friendly message.
-2. **Admin / Dean configures courses, strand maps, and caps** (`/admin/courses`)
-   - Courses live in `course_departments` and `course_passing_scores`.
-   - Each course has a `pass_from` rank (1–10) and an optional cap (`course_caps.max_slots`).
-   - Caps are enforced at registration time **and** when releasing results.
-3. **Admin provisions Staff / Dean / SSO accounts** (`/admin/users`)
-   - Every staff/dean account must have a `department` matching the college it serves (e.g. `College of Computer Studies`). This is what scopes the interview queue.
-4. **SSO builds the entrance exam** (`/staff/exam`)
-   - Title, scheduled date, access password, sections, questions (multiple choice, checkbox, dropdown, short answer, paragraph, linear scale).
-   - Only one exam can be active at a time (`is_active = 1`).
-5. **SSO creates exam rooms** (`/staff/exam/slots`)
-   - Date + start/end time + room label + department + capacity. Supports batch create.
-6. **Staff creates interview sessions** (`/staff/interviews/setup`)
-   - Per-college list. **+ Add Session** asks for date, start/end time, capacity, interviewer (auto-filled with the logged-in Staff/Dean), location label, location notes. There is no separate Desk concept anymore — desk and session were merged into `interview_slots`.
+5. **Staff creates Exam Room Slots** (`staff_slots.php`)
+   - Defines exam date, time, room label, department, and capacity
+   - Supports batch creation of multiple rooms at once
+   - Applicants are auto-assigned to slots after document approval
 
-### Phase 1 — Registration
+6. **Staff sets up Interview Infrastructure** (`staff_setup.php`, `staff_desks.php`)
+   - Creates interview desks per department
+   - Creates interview time slots (date, time, capacity, department)
+   - Supports batch creation across date ranges with day-of-week selection
 
-`POST /register` (`modules/auth/register.php`):
+7. **Admin configures branding** (`admin.php`)
+   - School name, accent color, logo upload
 
-1. Admissions-window check. Blocked if closed.
-2. hCaptcha verification.
-3. Field validation: name, birthdate, sex, street address + Pasig barangay (hardcoded list of 30), phone, email, password (≥ 8 chars), applicant type (`freshman | transferee | foreign`), course, SHS strand (freshmen only).
-4. **Course-cap pre-check** — if `accepted_count ≥ max_slots` for the chosen course in the current school year, registration is blocked.
-5. **Strand compatibility check** — freshmen's SHS strand must be in the course's `strands` allowlist.
-6. **Duplicate detection** — same `first_name + last_name + birthdate` is rejected.
-7. On success, inside a transaction:
-   - Insert into `users` with `role = 'student'`, `department = course_to_department(course)`, password bcrypt-hashed (cost 12).
-   - Insert into `applicants` with `overall_status = 'pending'`.
-   - Pre-create the required `documents` rows in `status = 'pending'`.
-8. Outside the transaction:
-   - Generate a verification credential pair (a magic-link token + a 6-digit code).
-   - Send the verification email via PHPMailer + Gmail SMTP.
-   - **The user is NOT auto-logged in.** They're redirected to `/verify-pending`.
+### Phase 1: Student Registration
 
-### Phase 2 — Email verification
+1. **Student visits `/register`** — Only accessible during the admissions window
+   - If admissions are closed, they see a message with the window dates
+   - Fills in: name, birthdate, sex, address (Pasig barangays only), phone, email, password
+   - Selects applicant type (Freshman / Transferee / Foreign)
+   - Selects course to apply for (filtered by SHS strand for freshmen)
+   - Course cap check at registration time — if the course is full, registration is blocked
+   - hCaptcha verification required
+   - System creates a `users` row + `applicants` row with `overall_status = 'pending'`
 
-`/verify-pending` (`modules/auth/verify_pending.php`):
+### Phase 2: Document Submission
 
-- Shows a 6-digit code form and a "Resend code" button with a cooldown timer (default 60 seconds).
-- Code verification: success → auto-login + redirect to `/student/documents`. Failure increments `email_verify_attempts`.
-- The magic link in the email (`/verify-email?token=…`) does the same thing — clicking it logs the user in.
-- `modules/auth/login.php` will send unverified students back to `/verify-pending` rather than refusing them.
+1. **Student uploads required documents** (`student_upload.php`)
+   - Document list depends on applicant type:
+     - **All applicants:** Government ID, PSA Birth Certificate, Passport Photos, Parent ID, Proof of Income, Guardianship Affidavit
+     - **Freshmen additionally:** Form 138 or Form 137
+     - **Transferees additionally:** Transcript of Records, Good Moral Certificate
+     - **Foreign additionally:** TOR, Good Moral, Passport, Visa/Study Permit, Alien Certificate
+   - Files accepted: PDF, JPG, PNG, WEBP (max 5 MB each)
+   - Uploads go to local `/uploads/` (development)
+   - **Each upload is auto-validated** (file format, size, image integrity, PDF structure/text extraction)
+   - Status per document: pending → uploaded → approved/rejected
+   - Student can only submit their application (click "Submit") once ALL documents are uploaded
 
-The verification columns (`email_verified`, `email_verify_token`, `email_verify_code`, `email_verify_code_expires_at`, `email_verify_attempts`, `email_verify_last_sent_at`) are auto-created by `ensure_email_verification_columns()` in `core/automation.php`.
+2. **Student submits application**
+   - `overall_status` changes from `pending` → `submitted`
+   - Student can withdraw their submission (returns to `documents` status)
 
-> **Demo bypass:** `database/seed_demo.sql` inserts every demo student with `email_verified = 1`, so they skip the verification gate during presentations.
+3. **Document Deadline Enforcement**
+   - If admin has set a document deadline and it passes:
+     - Students who **haven't submitted** see a polite "Document Submission Closed" page
+     - Students who **already submitted** continue to access the site normally
+     - POST requests to upload/submit are blocked for non-submitted students
 
-### Phase 3 — Document submission
+### Phase 3: Staff Document Review
 
-`modules/documents/student_upload.php`:
+1. **Staff reviews applicants** (`staff_review.php`)
+   - Default view shows "Pending" status filter
+   - Can view each applicant's uploaded documents
+   - Per-document actions: Approve, Reject (with reason), Request Resubmission (with reason)
+   - Bulk actions: Approve All Selected, Reject All Selected, Approve All Pending
+   - Can undo approval (revert to uploaded) if applicant hasn't taken the exam yet
 
-1. **Document list depends on applicant type** (from `config/app.php`):
-   - **Core (all)**: government ID, PSA birth certificate, passport photos, parent ID, proof of income, guardianship affidavit.
-   - **Freshman**: form 138 (or form 137).
-   - **Transferee**: TOR + good moral.
-   - **Foreign**: TOR + good moral + passport + visa/study permit + alien certificate.
-2. **Upload constraints**: PDF / JPG / PNG / WEBP, ≤ 5 MB per file.
-3. **Auto-validation pipeline** (`auto_validate_document()` in `core/automation.php`):
-   - Step 1: MIME-type + size check.
-   - Step 2: Image integrity (decode with GD, check minimum dimensions).
-   - Step 3: PDF header + basic text extraction.
-   - Step 4: Minimum file-size heuristic (rejects blank scans).
-   - Confidence ≥ 70 → passed, ≥ 40 → uncertain, < 40 → failed.
-   - Results logged to `document_validations`. A separate Puter-AI (Claude in the browser) check is invoked client-side via `modules/api/auto_validate` and feeds back through `save_ai_validation()`.
-4. **Status transitions**:
-   - Upload moves a single document from `pending` → `uploaded`.
-   - Once **all** required documents are `uploaded` (or already `approved`) the student can click **Submit**, which sets `applicants.overall_status = 'submitted'`.
-   - Student can withdraw their submission (back to `documents`) up until the first staff approval.
-   - Once `overall_status` is past `documents` (i.e. exam / interview / released), changing applicant type is locked.
-5. **Document deadline enforcement** — if the admin set a doc deadline and it has passed, applicants who haven't submitted see a "Document Submission Closed" page. POST is blocked server-side. Applicants who already submitted continue normally.
+2. **When all documents are approved:**
+   - `overall_status` automatically advances to `exam`
+   - `documents_approved_at` timestamp is recorded
+   - **System auto-assigns the student to an exam slot** (department-matched, earliest available, FCFS)
+   - Student receives an in-app notification
 
-### Phase 4 — Staff document review
+### Phase 4: Entrance Exam
 
-`modules/documents/staff_review.php` — the document-review queue, used by SSO (and admin/dean as oversight).
+1. **Student sees their exam slot** (`take.php`)
+   - If no slot assigned yet: "Awaiting Slot Assignment" message
+   - If slot is in the future: countdown card with date, time, room
+   - If slot is today: password gate — student enters the exam access password
 
-- Default tab: applicants with `overall_status IN ('documents', 'submitted')`.
-- Per-document actions: **Approve**, **Reject** (with reason), **Request Resubmission** (softer; comes with instructions).
-- Bulk actions: approve / reject / request-resubmit all selected rows.
-- **The moment every required document is `approved`**, `staff_action.php` runs:
-  ```sql
-  UPDATE applicants
-     SET overall_status = 'exam',
-         documents_approved_at = COALESCE(documents_approved_at, NOW())
-   WHERE id = ?
-     AND overall_status NOT IN ('exam','interview','released')
-  ```
-  Then it calls `notify_stage_transition()` (in-app + email) **and** `auto_assign_exam_slot()`.
-- **Undo approval** is allowed only while the applicant hasn't taken the exam yet. It rolls `overall_status` back from `exam` to `submitted`.
+2. **Student takes the exam**
+   - Google Forms-style rendering with anti-cheating measures (text selection disabled)
+   - Timer display (from scheduled start to end time)
+   - Sections rendered in order, each with instructions
+   - On submission:
+     - Raw score calculated (auto-graded for objective questions)
+     - Score → 1-10 rank via percentage (e.g., 70% = rank 7)
+     - Rank compared against course-specific tier thresholds
+     - Result: **Passed** (rank ≥ passing threshold) or **Failed**
+     - `exam_results` row created with score, rank, pass/fail
 
-### Phase 5 — Entrance exam
+3. **If passed:** `overall_status` → `interview`, student is auto-assigned to an interview slot
+4. **If failed:** Student stays at `exam` status, sees their score and result
+   - Staff can suggest an alternative course the student qualifies for
 
-Once `overall_status = 'exam'`, `auto_assign_exam_slot()` (`core/automation.php`) picks the earliest-available, lowest-fill exam room in the applicant's department and inserts a row into `applicant_exam_slots`. SSO can also assign manually from `/staff/exam/slots`.
+### Phase 5: Interview
 
-`modules/exam/take.php` (the student-facing exam page) renders in three states:
+1. **Student is auto-assigned an interview slot** (department-matched, fair distribution algorithm)
+   - Picks the slot with the lowest booked count → earliest date → earliest time
+   - Student sees their interview date, time, desk assignment on the interview page
+   - On interview day: student clicks **"I'm Here"** to check in → status changes to `checked_in`
 
-1. **No slot yet** → "Awaiting Slot Assignment" notice.
-2. **Slot is in the future** → countdown card with date, time, room.
-3. **Slot is today** → access-password gate, then the exam itself.
+2. **Staff manages the live queue** (`staff_queue.php`)
+   - Sees all students for today's session (checked-in, in-progress, completed, no-show)
+   - **Call Next**: pulls the next checked-in student (FIFO by check-in time)
+   - **Inline Evaluation**: staff marks Pass/Fail with optional notes
+   - **Complete Interview**: marks the interview as done
 
-Anti-cheating measures during the exam:
-- Text selection disabled.
-- Timer counts from scheduled start to end time.
-- Autosave: every 60s the partial answers are POSTed to `/api/exam-autosave` and stored in `exam_drafts`. On reload, drafts are restored.
+3. **When interview is completed:**
+   - Student is automatically set to **"waitlisted"** in admission_results
+   - `overall_status` → `released`
+   - Student receives a notification
 
-On submit:
+4. **No-shows:**
+   - Staff marks students as no-show
+   - No-shows can be rescheduled to a future slot (manual or auto-reschedule)
 
-```text
-raw_score   = sum of correct points across auto-gradable items
-percentage  = raw_score / total * 100
-rank        = ceil(percentage / 10)            # clamped 1..10
-passed      = rank >= course_passing_scores.pass_from   # default 4
-```
+### Phase 6: Results & Admission Decision
 
-Then a row goes into `exam_results`. **Tier labels** (purely cosmetic on result pages):
+1. **Staff reviews results** (`staff_manage.php`)
+   - Table view with filters: All, Pending, Accepted, Waitlisted, Rejected, Withdrawn
+   - Two action buttons per row: **Approve** or **Reject**
+   - Bulk actions: Accept Selected, Waitlist Selected, Reject Selected
+   - **Auto-release**: one-click button that auto-decides based on score thresholds + interview result
 
-| Rank | Tier   | Verdict   |
-|-----:|:-------|:----------|
-| 7–10 | High   | Passed    |
-| 4–6  | Average | Passed    |
-| 1–3  | Low    | Rejected  |
+2. **Auto-release logic** (when enabled):
+   - Rank ≥ course threshold AND interview passed → **Accepted**
+   - Rank ≥ (threshold - 1) AND interview passed → **Waitlisted**
+   - Otherwise → **Rejected**
 
-- **Passed**: `overall_status` flips to `interview`, and `assign_interview_slot()` is called immediately (see Phase 6).
-- **Failed**: status stays at `exam`. `suggest_alt_courses()` proposes courses with a lower `pass_from` the score would have qualified for; SSO can then push a suggestion via `staff_suggest.php`.
+3. **Course suggestions** (`staff_suggest.php`)
+   - For students who failed their chosen course but qualify for another
+   - Staff selects an alternative course → student sees the suggestion on their result page
 
-### Phase 6 — Interview
+4. **Student views result** (`student_view.php`)
+   - Sees: Accepted, Waitlisted, or Rejected
+   - If accepted: can confirm enrollment intent
+   - Can withdraw their application at any stage (with optional reason)
 
-`core/interview_scheduler.php :: assign_interview_slot()`:
+### Phase 7: Post-Decision
 
-1. Resolves the applicant's department from `users.department` first, falling back to `course_to_department(course_applied)` and opportunistically backfilling `users.department`.
-2. Inside a `FOR UPDATE` transaction:
-   - Lock all open future slots in that department.
-   - Pick the one with the **lowest booked count → earliest date → earliest time** (fair distribution).
-   - Refuse if the applicant already has an active queue row (no double-booking).
-3. Insert into `interview_queue`:
-   - `status = 'checked_in'` (yes, immediately — there is no longer an "I'm Here" button).
-   - `queue_number` = sequential per-slot.
-   - `checked_in_at = NOW()`.
-4. Audit log + in-app + email notification.
+1. **Waitlist auto-promotion:**
+   - When an accepted student withdraws, the system auto-promotes the next waitlisted student in the same course
+   - Ranked by exam score (highest first), then documents_approved_at (FCFS)
+   - Promoted student gets a notification
 
-If no slot exists yet (e.g. Staff hasn't created any sessions for that college), the applicant stays at `overall_status = 'interview'` with no queue row. The next time a Staff member creates a session for that department in `/staff/interviews/setup`, `bulk_assign_pending_applicants($dept)` sweeps every waiting applicant into the new slot.
-
-**On interview day** (`modules/interview/staff_queue.php`):
-
-- The Live Queue page is scoped:
-  - **Staff (Professor)** → only rows where `COALESCE(s.assigned_to, s.created_by) = self`.
-  - **Dean** → all rows where `s.department = staff.department`.
-  - **Admin / SSO** → can pick a college or see everything via `?college=__all__`.
-- Actions:
-  - **Call Next** flips the next `checked_in` row to `in_progress`.
-  - **Evaluate Pass / Fail** records `evaluation_result` on the queue row and `interview_completed_at` on the applicant.
-  - **Mark No-show** sets `attendance_status = 'absent'`. Auto-reschedule (`auto_reschedule_noshows`) can route them to the next available slot.
-
-The applicant page (`/student/interview`) is read-only — it shows their date, time, location, interviewer, and a live queue position ("you are #3 in line") computed against `checked_in` rows ahead of them. Students can submit a reschedule request from the same page (POSTs to `/api/reschedule-request`).
-
-### Phase 7 — Admission decision (results)
-
-`modules/results/staff_manage.php` is the results console. It buckets applicants:
-
-| Bucket          | Predicate |
-|-----------------|-----------|
-| **Ready: Accept**  | `exam_passed = 1 AND interview = pass` |
-| **Ready: Reject**  | `exam_passed = 0 OR interview = fail` |
-| **Awaiting**       | Interview not yet evaluated |
-| **Released**       | Already has an `admission_results` row |
-| **Withdrawn**      | `applicants.overall_status = 'withdrawn'` |
-
-> **Note on waitlist:** the `admission_results.result` column still allows `waitlisted` for backward compatibility, and the seed data includes legacy waitlisted rows, but the **current staff UI only emits accepted or rejected**. The auto-promote-waitlist function in `core/automation.php` is a documented no-op stub.
-
-**Three ways to release:**
-
-1. **Single row** — Accept or Reject buttons on `/staff/results`. Calls `staff_action.php`, which inserts a row into `admission_results`, flips `overall_status = 'released'`, audits, and notifies.
-2. **Bulk** — checkbox selection + Accept Selected / Reject Selected. Calls `staff_bulk.php`. Skips withdrawn applicants and applicants with an existing result.
-3. **Auto-release** — `POST /staff/results/auto-release`. Calls `auto_release_results()`, which walks every `overall_status IN ('exam','interview','released')` row without a result and emits `accepted` (exam passed AND interview passed) or `rejected` (exam failed OR interview failed). Skips applicants whose interview hasn't been evaluated yet. Only runs when `school_settings.auto_release_results = '1'`.
-
-### Phase 8 — Enrollment intent
-
-`modules/results/enrollment_intent.php` handles `POST /student/result`:
-
-- Accepted students see **"I Confirm My Enrollment"** and **"Decline Slot"** on `/student/result`.
-- Confirming sets `admission_results.enrollment_intent = 'confirmed'` and stamps `intent_submitted_at`.
-- Declining sets `enrollment_intent = 'declined'` **and** flips `overall_status = 'withdrawn'`.
-- Withdrawing also accepts a free-text reason saved to `applicants.withdrawn_reason`.
-
-The legacy "promote next from waitlist" hook fires here but is currently a no-op.
-
-There is also an **auto-expire** sweep (`auto_expire_accepted_pending` in `automation.php`): accepted students who don't act within `enrollment_intent_deadline_days` (default 7) get auto-withdrawn with a "Slot expired" notification.
+2. **Withdrawal:**
+   - Students can withdraw at any stage before confirming enrollment
+   - Cannot withdraw after enrollment is confirmed
+   - Triggers waitlist auto-promotion for the vacated spot
 
 ---
 
-## 4. Automations Cheat-Sheet
+## 3. What the System Automates
 
-Every automation toggle lives in `school_settings` and is toggleable from `/admin/settings`.
+| Automation | Trigger | What Happens |
+|-----------|---------|-------------|
+| **Document auto-validation** | File upload | OCR-style checks: format, size, image integrity, PDF structure/text extraction. Auto-approves high-confidence documents. |
+| **Exam slot auto-assignment** | All docs approved | Assigns student to earliest available exam slot matching their department. Notifies student. |
+| **Exam auto-grading** | Student submits exam | Scores objective questions, calculates rank (1-10), determines pass/fail against course threshold. |
+| **Interview slot auto-assignment** | Student passes exam (or new slot created) | Fair-distribution algorithm assigns student to least-filled slot matching their department. |
+| **Auto-waitlist after interview** | Interview marked completed | Student is automatically set to "waitlisted" status — staff then upgrades to accepted or downgrades to rejected. |
+| **Auto-release results** | Staff clicks "Auto Release" button | Batch-decides all pending results based on exam rank + interview evaluation. |
+| **Waitlist auto-promotion** | Accepted student withdraws | Promotes highest-ranked waitlisted student in the same course. Sends notification. |
+| **In-app notifications** | Each status transition | Students receive notifications for: docs submitted, docs approved, exam slot assigned, interview scheduled, result released, waitlist promotion, withdrawal. |
+| **School year derivation** | Admissions window set | Auto-calculates AY from the open date year. |
+| **Course cap enforcement** | Registration + acceptance | Blocks registration when course is full. Tracks accepted count vs max slots. |
+| **Document deadline enforcement** | Date passes | Blocks document uploads/submissions for students who haven't submitted. Shows a polite "closed" page. |
+| **Audit logging** | Every significant action | Records who did what, when, with entity references. Visible in admin audit log. |
 
-| Setting key                   | Default | What it does |
-|------------------------------|---------|--------------|
-| `auto_validate_documents`     | `1`     | Run the OCR-style pipeline on every upload + (client-side) Puter AI fallback |
-| `auto_assign_exam_slots`      | `1`     | Drop applicant into the next exam room when all docs are approved |
-| `auto_reschedule_noshows`     | `1`     | Move interview no-shows to the next available slot for their department |
-| `auto_release_results`        | `0`     | Allow the auto-release sweep to flip Ready: Accept / Ready: Reject into released |
-| `auto_promote_waitlist`       | `1`     | **Deprecated** — the function is a no-op stub since waitlist was retired |
+### Automation Settings (Toggleable by Admin)
 
-Triggers that always fire (not toggleable):
-
-- All-docs-approved → `overall_status = 'exam'` + `auto_assign_exam_slot()` + notification.
-- Exam pass → `overall_status = 'interview'` + `assign_interview_slot()` + notification.
-- Staff creates a new interview session → `bulk_assign_pending_applicants()` sweeps unscheduled applicants in that department into the new slot.
-- `interview_queue` evaluation → if Pass, applicant lands in **Ready: Accept**; if Fail, **Ready: Reject**. Nothing is auto-released unless the toggle is on.
-- Notifications (in-app + email via PHPMailer) on every status transition.
-- Audit log row on every state-changing action.
-
----
-
-## 5. Department Scoping (who sees whom)
-
-This is the area that caused the demo seed regression — worth calling out explicitly.
-
-| Page                        | Scope rule |
-|-----------------------------|-----------|
-| `/student/documents`        | Always shows the logged-in student's own applicant. No cross-applicant access. |
-| `/staff/applicants` (doc review) | **Unscoped by college** — this is the SSO global doc-review queue. SSO, Dean, Admin all see all colleges here. (Doc review is centralized; only interview / results are per-college.) |
-| `/staff/applicants/{id}`    | Permitted for SSO/Admin always. Dean is granted only if `users.department = applicant.department`. |
-| `/staff/interviews/setup`   | Staff & Dean see their own college's sessions. Admin/SSO can pick a college. |
-| `/staff/interviews/queue`   | Staff → only their own assigned/created sessions. Dean → all sessions in their college. Admin/SSO → college picker, with `?college=__all__` escape. |
-| `/staff/results`            | Staff is blocked. Dean → only applicants in their college. SSO/Admin → all. |
-| `/admin/users`, `/admin/school-year`, `/admin/settings` | Admin only. |
-| `/admin/courses`            | Admin → all courses. Dean → can edit `max_slots` on courses in their college. |
-| `/admin/audit-log`          | Admin + Staff/Dean (read-only). |
+| Setting Key | Default | Effect |
+|------------|---------|--------|
+| `auto_validate_documents` | `1` (on) | Enable/disable OCR-style document validation |
+| `auto_assign_exam_slots` | `1` (on) | Enable/disable automatic exam slot assignment |
+| `auto_promote_waitlist` | `1` (on) | Enable/disable automatic waitlist promotion |
+| `auto_release_results` | `0` (off) | Enable/disable automatic result release |
 
 ---
 
-## 6. Edge Cases & Business Rules
+## 4. Special Situations & Edge Cases
 
-### 6.1 Course is full at registration
-Cap check runs against `course_caps.max_slots` vs current `accepted` count. Registration is blocked with a clear error and the course gets a red "Full" badge in the UI.
+### 4.1 Course is Full at Registration
+- The system checks enrollment caps at registration time
+- If the course has reached its max accepted students, registration is blocked with an error
+- The courses table shows a red "Full" badge
 
-### 6.2 Student fails the exam
-Stays at `overall_status = 'exam'`. `suggest_alt_courses()` lists courses with a lower `pass_from` that the score would have qualified for. SSO can suggest one via `/staff/results/suggest/{id}`. The student sees the suggestion on `/student/result` and can accept (which changes their `course_applied`) or decline.
+### 4.2 Student Fails the Exam
+- Student stays at `exam` status — they cannot proceed to interview
+- Staff can view their score and suggest an alternative course they qualify for
+- The student sees the suggestion on their result page and can accept/decline
 
-### 6.3 Document rejection / resubmission
-Rejecting a document does NOT roll back the applicant if they were already past `documents`. Requesting Resubmission is a softer alternative — it puts the document back to `uploaded` with staff instructions in `staff_remarks`. Either way the student sees the reason and can re-upload.
+### 4.3 Document Rejection / Resubmission
+- When staff rejects a document, the applicant's status reverts to `documents`
+- The student sees the rejection reason and can upload a corrected version
+- Staff can also request resubmission (less harsh than rejection) with specific instructions
+- Student receives a notification about required corrections
 
-### 6.4 Interview no-show
-Staff hits **Mark No-show** on the queue row → `attendance_status = 'absent'`. If `auto_reschedule_noshows = 1`, the next sweep books them into the next available slot for their department. Staff can also reschedule manually.
+### 4.4 Interview No-Show
+- Staff marks the student as a no-show on the queue page
+- The system can auto-reschedule no-shows to the next available slot
+- Staff can also manually reschedule to a specific slot
+- Reschedule history is logged in `reschedule_logs`
 
-### 6.5 Student reschedule request
-`/student/interview` shows a "Need to reschedule?" details panel. POSTs to `/api/reschedule-request` with a free-text reason. Logged to `reschedule_requests`; staff can approve via the queue page.
+### 4.5 Admissions Window Closed
+- New registrations are blocked — students see the window dates
+- Existing applicants can still log in and continue their process
+- This is independent of the document deadline
 
-### 6.6 Admissions window closed
-`/register` shows a "Closed" page. Existing applicants are unaffected and can still log in to continue their journey.
+### 4.6 Document Deadline Passed
+- Students who haven't submitted their documents see a "Document Submission Closed" page
+- Students who already submitted continue normally (exam, interview, results)
+- POST requests to upload/submit documents are blocked server-side
 
-### 6.7 Document deadline passed
-Students who haven't yet submitted see "Document Submission Closed". POST to upload/submit is blocked server-side. Submitted students proceed normally.
+### 4.7 Student Withdraws After Acceptance
+- The vacated spot triggers **auto-promotion** of the highest-ranked waitlisted student
+- The promoted student receives a notification: "You have been promoted from the waitlist"
+- The withdrawal is logged with timestamp and optional reason
 
-### 6.8 Withdrawal
-Allowed at any stage before `withdrawn`. Sets `overall_status = 'withdrawn'`, `withdrawn_at = NOW()`, optional reason. The student loses their interview slot and admission result row.
+### 4.8 Staff Undoes a Document Approval
+- Staff can revert an approved document back to "uploaded" status
+- Only possible if the applicant hasn't taken the exam yet
+- If the applicant was auto-advanced to exam status, they're rolled back to "submitted"
 
-### 6.9 Acceptance expired (no enrollment intent)
-After `enrollment_intent_deadline_days` (default 7), accepted applicants who didn't confirm or decline are auto-withdrawn by `auto_expire_accepted_pending()` with a "Slot expired" notification.
+### 4.9 Multiple Custom Courses
+- Admin can add custom courses beyond the 13 built-in PLP programs
+- Custom courses have configurable strand requirements and can be activated/deactivated
+- They appear in registration dropdowns and result suggestions
 
-### 6.10 Staff undoes a document approval
-Allowed only if the applicant hasn't taken the exam yet. Rolls `documents.status` from `approved` to `uploaded` and `applicants.overall_status` from `exam` to `submitted`.
+### 4.10 Exam Slot Doesn't Match Department
+- The auto-assign algorithm first tries to match the student's department
+- If no department-specific slot is available, it falls back to any available slot
+- This prevents students from being stuck waiting indefinitely
 
-### 6.11 Custom courses
-Admin can add courses beyond the 13 built-in PLP programs via `/admin/courses`. Each custom course gets its own strand allowlist, `pass_from`, and `max_slots`. They appear in registration immediately.
-
-### 6.12 Session timeouts
-Student sessions expire after 30 minutes of inactivity; staff sessions after 2 hours. A warning appears 5 minutes before expiry. `POST /auth/keepalive` extends the session.
+### 4.11 Session Timeout
+- Student sessions: 30 minutes
+- Staff sessions: 2 hours
+- A warning appears 5 minutes before expiry
+- Keepalive endpoint (`/auth/keepalive`) can extend the session
 
 ---
 
-## 7. Frequently Asked Questions
-
-### "Can a CCS professor interview a CON student?"
-No (by default). Live-queue scoping for Staff is `COALESCE(s.assigned_to, s.created_by) = me` — and a Staff member can only create sessions in their own department, so they will never end up assigned to a CON session. An Admin/SSO can override by explicitly assigning across colleges, but that's a deliberate action, not the default.
+## 5. Hard-Hitting Client Questions & Answers
 
 ### "What if someone uploads a fake document?"
-Auto-validation catches blank pages, corrupted files, wrong formats, and PDFs without text. It does **not** verify authenticity — that still needs human eyes. The Puter AI fallback runs client-side and gives a confidence score, but it's an aid, not a guarantee.
 
-### "What prevents impersonation at the exam?"
-Login + per-slot access password + name shown on the exam interface. There's no facial verification or proctoring software. In-room proctors should still check physical IDs.
+**How the system handles it:** Every uploaded document goes through automated validation (OCR-style checks — file format, size, image integrity, PDF structure, text extraction). Documents with high confidence scores are auto-approved; uncertain ones are flagged for manual review. Staff can also use an AI validation fallback (Puter AI) for documents the OCR couldn't confidently assess.
 
-### "What happens if the server dies mid-exam?"
-Answers autosave to `exam_drafts` every 60 s. On reload after recovery, drafts are restored.
+**Gap:** The auto-validation checks file validity, not content authenticity. It can catch blank pages, corrupted files, and wrong formats, but it cannot verify that a birth certificate is real or that grades on a Form 138 are genuine. **This ultimately still requires human judgment.** Consider adding a disclaimer that all documents are subject to verification and false documents will result in application revocation.
 
-### "Can staff manipulate results?"
-Every state change writes to `audit_logs` (actor user, IP, action, entity, timestamp). The admin audit log at `/admin/audit-log` shows the full trail. Logs are stored in the same DB as the data, so an admin with raw DB access could tamper — for high-stakes deployments, export the log to an external store.
+---
 
-### "How many applicants can it handle?"
-Realistically, single-institution scale (a few thousand applicants per cycle). MySQL pagination is everywhere, queries are indexed, exam slots have configurable capacity. The exam submit path is the hot spot — under simultaneous heavy submission load you'd want a queue.
+### "What prevents a student from taking the exam for someone else?"
 
-### "Can we run two school years simultaneously?"
-No. `current_school_year` is a single global setting; only one exam can be `is_active = 1`.
+**How the system handles it:** The exam requires an access password issued by staff, and students must be assigned to a specific slot (date + time + room). The exam page is only accessible when logged in as the assigned student, on the assigned date.
+
+**Gap:** There is no identity verification at exam time (no photo matching, no proctoring). A student could share their login credentials. **Recommendation:** The in-person exam room should have physical ID verification by proctors. The system supports this by showing the student's name and details on the exam interface.
+
+---
+
+### "What happens if the server goes down during an exam?"
+
+**How the system handles it:** The exam form submits all answers at once at the end. If the server goes down mid-exam, answers are lost.
+
+**Gap:** There is no auto-save or draft functionality during the exam. If a student's browser crashes or the server goes down, they lose all progress. **Recommendation:** Add periodic AJAX auto-save (every 60 seconds) that stores partial answers server-side.
+
+---
+
+### "Can staff manipulate results to favor certain students?"
+
+**How the system handles it:** Every action is recorded in the audit log (`audit_logs` table) with the acting user's ID, timestamp, IP address, and description. This creates a complete paper trail. Admin can review the audit log at `/admin/audit-log`.
+
+**Gap:** Audit logs are not immutable — an admin with database access could modify them. For stronger accountability, consider making audit logs append-only at the database level, or exporting them to an external system.
+
+---
+
+### "What if two staff members approve the same document at the same time?"
+
+**How the system handles it:** The `UPDATE documents SET status='approved'` query is idempotent — running it twice has the same effect. The auto-advance to exam stage also has a guard (`WHERE overall_status NOT IN ('exam','interview','result')`) preventing double-advancement.
+
+---
+
+### "How do we handle thousands of applicants at once?"
+
+**Current capacity:** The system uses MySQL pagination (25 items per page), indexed queries, and connection pooling. The exam slot system has configurable capacity per room (default 35) and daily caps (default 3,000).
+
+**Potential bottleneck:** The exam submission page processes all questions in a single POST request with no rate limiting. Under heavy load (1,000+ simultaneous submissions), the database could become a bottleneck. **Recommendation:** Add queue-based processing for exam submissions, or at minimum database connection pooling with `PDO::ATTR_PERSISTENT`.
+
+---
+
+### "Can we run admissions for multiple school years simultaneously?"
+
+**How the system handles it:** Each applicant has a `school_year` field, and the system tracks the "current" school year. However, only one exam can be active at a time (`is_active=1`), and the admissions window is a single global date range.
+
+**Gap:** The system does not support multiple concurrent admissions cycles. Starting a new cycle deactivates the previous exam. If you need to run midyear admissions alongside regular admissions, the current architecture doesn't support it without modifications.
+
+---
+
+### "What if we change the tier thresholds after some students have already been graded?"
+
+**How the system handles it:** Exam results store the absolute score and rank at the time of grading. Changing tier thresholds affects future grading but does NOT retroactively change existing results. The `course_passing_scores` table is separate from `exam_results`.
+
+**This is actually correct behavior** — students should be judged by the standards in place when they took the exam. But staff should be aware that changing thresholds mid-cycle creates inconsistency.
+
+---
 
 ### "What data can we export?"
-CSV from `/admin/dashboard` (applicants with filters) and `/admin/results`. No PDF letters yet.
 
-### "Can parents log in?"
-No — there's no guardian portal. Only the student account.
+**How the system handles it:** The admin dashboard (`admin/dashboard.php`) supports CSV export with filters (date range, status). Exported fields include: name, email, sex, age, barangay, applicant type, course, status, result, dates. The results page (`admin/results`) also supports filtered exports.
 
----
-
-## 8. Known Gaps & Risks
-
-| # | Gap | Severity | Status |
-|---|-----|----------|--------|
-| 1 | Audit logs are not append-only at the DB level — an admin with SQL access can edit them | Medium | Open |
-| 2 | No 2FA for staff / admin | Medium | Open |
-| 3 | No PDF report generation (admission letters, exam summaries) | Low | Open |
-| 4 | Exam UI is laptop-oriented; mobile layout is rough | Low | Open |
-| 5 | No backup/restore docs — `schema.sql` is destructive | Medium | Open |
-| 6 | No accessibility (ARIA / screen-reader) pass | Low | Open |
-| 7 | Rejected students can't reapply in a future cycle without admin intervention | Low | Open |
-| 8 | No support for concurrent school years | Low | By design |
-| 9 | Waitlist tier is half-retired — schema still allows it but the UI doesn't emit it | Low | Tech debt |
-
-Already addressed in earlier work (kept here for historical context):
-
-- Email verification (verification email + code form).
-- Duplicate applicant detection on registration.
-- Exam autosave (`exam_drafts`).
-- Student-initiated reschedule requests.
-- Applicant type change before submission.
-- Login rate limiting (15-minute lockout after 5 failed attempts).
-- CSP / X-Frame-Options / X-Content-Type-Options security headers.
-- Email notifications via PHPMailer + Gmail SMTP.
-- Enrollment-intent flow (confirm / decline).
-- Secrets in `.env`, not in source.
+**Gap:** There is no PDF report generation (e.g., admission letters, exam results summaries). Only raw CSV export is available.
 
 ---
 
-## 9. Codebase Map
+### "How secure is the system?"
 
-### Core infrastructure
+**Security measures in place:**
+- CSRF tokens on all forms
+- Password hashing with bcrypt (cost 12)
+- Role-based access control (Auth guards on every route)
+- Input sanitization (`htmlspecialchars` everywhere)
+- Prepared statements for all DB queries (SQL injection prevention)
+- File type validation on uploads (MIME type check, not just extension)
+- Session regeneration on login
+- hCaptcha on login and registration
+- Audit logging with IP addresses
+- SSL required for non-localhost database connections
+- ✅ **Login rate limiting** — accounts lock for 15 minutes after 5 failed attempts (`login_attempts` table)
+- ✅ **Content Security Policy headers** — CSP, X-Content-Type-Options, X-Frame-Options, Referrer-Policy on all pages
+
+**Remaining gaps:**
+- ~~No rate limiting on login attempts (brute force risk)~~ → **FIXED**
+- ~~No account lockout after failed attempts~~ → **FIXED**
+- No two-factor authentication for admin/staff
+- ~~No Content Security Policy headers~~ → **FIXED**
+- Session tokens stored in default PHP session storage (not encrypted at rest)
+
+---
+
+### "What if a student applies to the wrong course?"
+
+**How the system handles it:** If a student fails the exam for their chosen course, staff can suggest an alternative course that the student's score qualifies for. The suggestion system checks the rank against the alternative course's threshold before allowing the suggestion.
+
+**Gap:** There is no way for a student to change their course *before* taking the exam. Once registered, the course is locked. If a student realizes they chose wrong, they would need to withdraw and re-register (losing their place in the queue).
+
+---
+
+### "Can parents or guardians access the system?"
+
+**Gap:** There is no parent/guardian portal. Only the student can log in and view their application status. Consider adding a read-only parent view or a shareable status link.
+
+---
+
+## 6. Unaddressed Problems & Risks
+
+### 6.1 ~~No Email Verification~~ → ✅ FIXED
+Students now receive a verification email with a link upon registration. Login is blocked until the email is verified. This prevents fake email registrations and ensures password recovery and notifications will reach the student.
+
+> **Implementation:** `modules/auth/verify_email.php`, `core/automation.php` (`generate_verify_token`, `send_verification_email`), `modules/auth/register.php` (sends token instead of auto-login), `modules/auth/login.php` (checks `email_verified` column).
+
+### 6.2 ~~No Duplicate Applicant Detection~~ → ✅ FIXED
+Registration now checks for existing applicants with the same **first name + last name + birthdate** combination. If a match is found, the student is prompted to use their existing account or contact the admissions office.
+
+> **Implementation:** `modules/auth/register.php` — added duplicate check query before account creation.
+
+### 6.3 ~~No Exam Auto-Save~~ → ✅ FIXED
+Exam answers are now auto-saved every 60 seconds via AJAX. If the browser crashes or internet drops, answers are restored from the `exam_drafts` table when the student returns. A subtle "Draft saved" indicator appears in the bottom-right corner.
+
+> **Implementation:** `modules/api/exam_autosave.php` (AJAX endpoint), `modules/exam/take.php` (auto-save JS + draft restore on load), `core/automation.php` (`ensure_exam_drafts_table`).
+
+### 6.4 ~~No Interview Rescheduling by Students~~ → ✅ FIXED
+Students can now submit a reschedule request with a reason from their interview page (collapsible "Need to reschedule?" section). Staff are notified and can approve/deny the request.
+
+> **Implementation:** `modules/api/reschedule_request.php`, `modules/interview/student_view.php` (reschedule form), `core/automation.php` (`ensure_reschedule_requests_table`).
+
+### 6.5 ~~No Applicant Type Change~~ → ✅ FIXED
+Students can now change their applicant type (Freshman/Transferee/Foreign) from the documents page **before** submitting. A dropdown selector appears above the document list. Changing the type automatically updates the required documents.
+
+> **Implementation:** `modules/documents/student_upload.php` — added `change_type` POST action and type selector UI.
+
+### 6.6 No Mobile-Responsive Exam Interface
+The exam uses CSS grid layouts that may not adapt well to mobile screens. If a student attempts the exam on a phone, the experience may be poor. **Risk: Accessibility issues for students without laptops.**
+
+### 6.7 No Backup/Recovery Process
+The schema file (`schema.sql`) is destructive — it drops all tables before recreating them. There's no documented backup/restore process. **Risk: Accidental data loss if schema is re-imported on production.**
+
+### 6.8 ~~Results Notification Only In-App~~ → ✅ FIXED (previously)
+Email notifications are now sent via Gmail SMTP (PHPMailer) for all stage transitions: registration welcome, document status updates, exam results, interview scheduling, and admission results.
+
+> **Implementation:** `core/helpers.php` (`send_email`, `email_template`), `core/automation.php` (`notify_stage_transition`, `send_registration_email`), `lib/PHPMailer/`.
+
+### 6.9 ~~No Enrollment Confirmation Flow~~ → ✅ FIXED
+Accepted students now see a prominent "I Confirm My Enrollment" button on their results page. Once clicked, the `enrollment_intent` column is set to `confirmed` and a success message is shown. Staff can see confirmed vs. unconfirmed students.
+
+> **Implementation:** `modules/results/student_view.php` (confirmation UI), `modules/results/enrollment_intent.php` (`confirm_enrollment` action).
+
+### 6.10 No Accessibility (a11y) Standards
+The UI uses custom CSS components without ARIA labels, keyboard navigation support, or screen reader compatibility. **Risk: Non-compliant with accessibility requirements; excludes students with disabilities.**
+
+
+
+### 6.11 No Support for Reapplication
+If a student is rejected, there's no mechanism for them to reapply in a future admissions cycle. Their email is permanently tied to a user account. **Risk: Rejected students cannot apply again without admin intervention.**
+
+---
+
+## 6.12 Additional Improvements Applied
+
+- **Auto-uppercase inputs**: All text inputs (names, addresses, etc.) are automatically displayed in uppercase via CSS `text-transform: uppercase`. Server-side, name fields are forced to uppercase with `mb_strtoupper()` on registration. Email and password fields are excluded.
+- **Email notifications**: PHPMailer + Gmail SMTP integrated for registration, document status, exam results, interview scheduling, admission results, and password reset.
+- **Secrets management**: All credentials (hCaptcha, SMTP) moved from hardcoded values to `.env` file loaded at runtime, with `.gitignore` protection.
+
+---
+
+## 7. File-by-File Reference
+
+### Core Infrastructure
 
 | File | Purpose |
 |------|---------|
-| `config/app.php` | Constants: paths, role names, document slugs per type, course list, strand maps, tier thresholds, role permissions |
-| `config/db.php` | PDO MySQL connection, SSL support for cloud DBs |
-| `core/bootstrap.php` | Loads config, session, auth, router, helpers, automation in order |
-| `core/Auth.php` | Login / logout / role guards / `homeUrl()` |
-| `core/Session.php` | Session lifecycle + flash messages |
-| `core/Router.php` | Path routing including `/staff/applicants/{id}` style params |
-| `core/helpers.php` | URL / CSRF helpers, admissions window, `score_to_rank`, `exam_passed`, `course_to_department`, `suggest_alt_courses`, etc. |
-| `core/automation.php` | All the auto-* logic: notifications, document validation pipeline, exam slot assignment, results auto-release, no-show auto-reschedule, expire-accepted-pending |
-| `core/interview_scheduler.php` | The interview-side algorithms: `assign_interview_slot`, `bulk_assign_pending_applicants`, `record_interview_evaluation`, `reschedule_absent_applicant` |
+| `config/app.php` | Application constants: paths, roles, documents, courses, departments, strand mappings, tier thresholds |
+| `config/db.php` | Database connection (MySQL/MariaDB) with SSL support for cloud DBs |
+| `core/bootstrap.php` | Loads all config, session, auth, router, helpers, automation |
+| `core/Auth.php` | Login/logout, role checks, route guards, home URL resolution |
+| `core/Session.php` | Session management with flash messages and timeout handling |
+| `core/Router.php` | URI routing with path parameters (e.g., `/staff/applicants/{id}`) |
+| `core/helpers.php` | URL helpers, CSRF, admissions window checks, score/rank calculations, document type resolution |
+| `core/automation.php` | Notifications, document auto-validation, exam slot auto-assignment, waitlist promotion, auto-release results, batch interview creation |
+| `core/interview_scheduler.php` | Interview slot assignment algorithm, department resolution, bulk assignment, evaluation recording, rescheduling |
 
 ### Authentication
 
-| Path | File |
-|------|------|
-| `/login` | `modules/auth/login.php` |
-| `/register` | `modules/auth/register.php` |
-| `/verify-email` | `modules/auth/verify_email.php` (magic-link path) |
-| `/verify-pending` | `modules/auth/verify_pending.php` (6-digit code path) |
-| `/forgot-password`, `/reset-password` | `modules/auth/forgot_password.php`, `modules/auth/reset_password.php` |
-| `/auth/keepalive` | `modules/auth/keepalive.php` |
-| `/logout` | `modules/auth/logout.php` |
+| File | Purpose |
+|------|---------|
+| `modules/auth/login.php` | Login form with hCaptcha, password toggle |
+| `modules/auth/register.php` | Student registration with admissions window check, course cap check, barangay validation |
+| `modules/auth/logout.php` | Session destruction and redirect |
+| `modules/auth/forgot_password.php` | Password reset request (email-based) |
+| `modules/auth/reset_password.php` | Password reset form with token validation |
+| `modules/auth/keepalive.php` | AJAX session keepalive endpoint |
 
-### Student-facing
-
-| Path | File |
-|------|------|
-| `/student/documents` | `modules/documents/student_upload.php` |
-| `/student/exam` | `modules/exam/take.php` |
-| `/student/interview` | `modules/interview/student_view.php` |
-| `/student/result` (GET) | `modules/results/student_view.php` |
-| `/student/result` (POST) | `modules/results/enrollment_intent.php` |
-| `/student/settings` | `modules/settings/student.php` |
-
-### Staff / Dean / SSO
-
-| Path | File |
-|------|------|
-| `/staff/dashboard` | `modules/auth/staff/dashboard.php` |
-| `/staff/applicants` (queue + per-applicant) | `modules/documents/staff_review.php` |
-| `POST /staff/documents/{id}` | `modules/documents/staff_action.php` |
-| `/staff/exam` (build the exam) | `modules/exam/staff_manage.php` |
-| `/staff/exam/slots` | `modules/exam/staff_slots.php` |
-| `/staff/exam/export-rooms` | `modules/exam/staff_export_rooms.php` |
-| `/staff/interviews/setup` | `modules/interview/staff_setup.php` |
-| `/staff/interviews/queue` | `modules/interview/staff_queue.php` |
-| `POST /staff/interviews/call-next` | `modules/interview/staff_call_next.php` |
-| `POST /staff/interviews/{id}` | `modules/interview/staff_action.php` |
-| `/staff/interviews/absent` | `modules/interview/staff_absent.php` |
-| `/staff/results` | `modules/results/staff_manage.php` |
-| `POST /staff/results/bulk` | `modules/results/staff_bulk.php` |
-| `POST /staff/results/auto-release` | `modules/results/staff_auto_release.php` |
-| `POST /staff/results/suggest/{id}` | `modules/results/staff_suggest.php` |
-| `POST /staff/results/{id}` | `modules/results/staff_action.php` |
-| `/staff/settings` | `modules/settings/staff.php` |
-| `/staff/audit-log` | `modules/audit/log.php` |
-
-### Admin
-
-| Path | File |
-|------|------|
-| `/admin/dashboard` | `modules/auth/admin/dashboard.php` |
-| `/admin/users` | `modules/settings/admin_users.php` |
-| `/admin/school-year` | `modules/settings/admin_school_year.php` |
-| `/admin/courses` | `modules/settings/admin_courses.php` |
-| `/admin/settings` | `modules/settings/admin.php` |
-| `/admin/results` | `modules/results/admin_export.php` |
-| `/admin/audit-log` | `modules/audit/log.php` |
-
-### AJAX / API
-
-| Path | File |
-|------|------|
-| `/api/notifications` | `modules/api/notifications.php` |
-| `/api/auto-validate` | `modules/api/auto_validate.php` |
-| `/api/exam-autosave` | `modules/api/exam_autosave.php` |
-| `/api/reschedule-request` | `modules/api/reschedule_request.php` |
-| `/api/applicant-panel` | `modules/api/applicant_panel.php` |
-
-### Database
+### Student Modules
 
 | File | Purpose |
 |------|---------|
-| `database/schema.sql` | Single-file destructive schema. Creates every table + seeds school settings, departments, courses, passing scores, the seed admin. Idempotent: drops everything first. |
-| `database/seed_users.sql` | Inserts admin (id 2), SSO (3), 6 Deans (ids 4–9), 6 Staff (ids 10–15). Departments are pre-set. |
-| `database/seed_demo.sql` | 121 demo applicants spread across the funnel + 36 interview sessions + 78 exam results + 299 notifications. Idempotent. All dates are relative to `CURDATE()` so today's queue is always populated. Every demo student is pre-verified. |
+| `modules/documents/student_upload.php` | Document upload/submission, deadline enforcement, file validation, stepper display, interview booking |
+| `modules/exam/take.php` | Exam-taking interface: slot gate, password gate, question rendering, auto-grading, result calculation |
+| `modules/interview/student_view.php` | Interview status display, check-in button, slot details, desk info |
+| `modules/results/student_view.php` | Result display (accepted/waitlisted/rejected), withdrawal form, course suggestion view |
+| `modules/results/enrollment_intent.php` | POST handler for student withdrawal with waitlist auto-promotion |
+| `modules/settings/student.php` | Student profile settings (name, password change) |
 
----
+### Staff Modules
 
-*Last verified against `baseline` after PR #4 (demo-seed fixes) merged.*
+| File | Purpose |
+|------|---------|
+| `modules/auth/staff/dashboard.php` | Staff dashboard with pipeline summary, quick actions (approve all docs, reschedule absent, send reminders) |
+| `modules/documents/staff_review.php` | Applicant list with status filters, document review, bulk approve/reject |
+| `modules/documents/staff_action.php` | POST handler: approve, reject, unapprove, advance to exam, request resubmission |
+| `modules/exam/staff_manage.php` | Exam builder: create/edit exams, add sections/questions, inline editing, exam sets |
+| `modules/exam/staff_slots.php` | Exam room slot management: create/edit/delete slots, batch create, applicant assignment |
+| `modules/interview/staff_manage.php` | Interview landing page with setup/queue cards and stats |
+| `modules/interview/staff_setup.php` | Interview desk and session setup |
+| `modules/interview/staff_queue.php` | Live interview queue: call next, evaluate, complete, mark no-show |
+| `modules/interview/staff_action.php` | POST handler: mark completed (auto-waitlists), complete with evaluation, mark no-show, delete/close/open slots |
+| `modules/interview/staff_absent.php` | Absent/no-show list with reschedule options |
+| `modules/interview/staff_call_next.php` | AJAX: pull next checked-in student from queue |
+| `modules/interview/staff_slot_view.php` | View roster for a specific interview slot |
+| `modules/results/staff_manage.php` | Results table with filters, approve/reject buttons per row |
+| `modules/results/staff_action.php` | POST handler: upsert admission result (accepted/waitlisted/rejected) |
+| `modules/results/staff_bulk.php` | Bulk set results for selected applicants |
+| `modules/results/staff_auto_release.php` | Auto-release all pending results based on score thresholds |
+| `modules/results/staff_suggest.php` | Suggest alternative course to a student |
+
+### Admin Modules
+
+| File | Purpose |
+|------|---------|
+| `modules/auth/admin/dashboard.php` | Admin dashboard: pipeline stats, date range filters, CSV export, charts |
+| `modules/settings/admin.php` | System settings: branding (logo, school name, accent color), admin password |
+| `modules/settings/admin_school_year.php` | Admissions window (open/close dates), document deadline, new cycle |
+| `modules/settings/admin_courses.php` | Course management: tier thresholds (per-row edit), enrollment caps, custom courses, strand reference |
+| `modules/settings/admin_users.php` | User management: create staff/admin accounts, activate/deactivate, assign departments |
+| `modules/results/admin_export.php` | Admin results export page |
+| `modules/audit/log.php` | Audit log viewer (all system actions with user, timestamp, IP, description) |
+
+### API & Misc
+
+| File | Purpose |
+|------|---------|
+| `modules/api/notifications.php` | AJAX: get/mark-read in-app notifications |
+| `modules/api/auto_validate.php` | AJAX: save AI validation results from client-side Puter AI |
+| `public/index.php` | Single entry point — all route definitions |
+| `database/schema.sql` | Complete database schema with seed data (destructive — drops all tables) |
+| `views/layouts/app.php` | Main layout: sidebar, header, stepper, notification bell, theme toggle |
+| `views/layouts/auth.php` | Auth page layout (login/register) |
+| `public/assets/css/app.css` | All styles: design tokens, components, sidebar, forms, tables, dark mode |
