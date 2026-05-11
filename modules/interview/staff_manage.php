@@ -1,420 +1,202 @@
 <?php
 // ============================================================
 // modules/interview/staff_manage.php
-// M5 — Staff: Interview Sessions (schedule management)
-// Desk info lives in /staff/settings
+// Landing page — two entry-point cards:
+//   1. Interview Setup (colleges → desks → schedules)
+//   2. Interview Queue (live calling + inline evaluation)
 // ============================================================
 
 require_once CORE_PATH . '/bootstrap.php';
-Auth::requireRole(ROLE_STAFF, ROLE_ADMIN);
+Auth::requireRole(ROLE_STAFF, ROLE_SSO, ROLE_DEAN, ROLE_ADMIN);
+
+// SSO is setup-only — they have no need for the two-card Setup vs Queue
+// landing, and they have no access to the queue at all. Send them
+// straight into Interview Setup so the sidebar item lands one click
+// closer to where they actually work.
+if (Auth::role() === ROLE_SSO) {
+    redirect('/staff/interviews/setup');
+}
 
 $db      = db();
 $staffId = Auth::id();
-$errors  = [];
-$success = [];
+$isAdmin = Auth::role() === ROLE_ADMIN;
+$today   = date('Y-m-d');
 
-// ----------------------------------------------------------------
-// POST actions
-// ----------------------------------------------------------------
-if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    csrf_check();
-    $action = $_POST['action'] ?? '';
-
-    if ($action === 'update_desk') {
-        $deskLabel = trim($_POST['desk_label'] ?? '');
-        $deskNotes = trim($_POST['desk_notes'] ?? '');
-        if (!$deskLabel) {
-            $errors[] = 'Location label is required.';
-        } else {
-            $db->prepare('UPDATE users SET desk_label=?, desk_notes=? WHERE id=?')
-               ->execute([$deskLabel, $deskNotes ?: null, $staffId]);
-            $success[] = 'Desk info saved.';
-        }
-    }
-
-    if ($action === 'create_slot') {
-        $date    = trim($_POST['slot_date']     ?? '');
-        $time    = trim($_POST['slot_time']     ?? '') ?: null;
-        $endTime = trim($_POST['slot_end_time'] ?? '') ?: null;
-        $capacity = max(1, (int)($_POST['capacity'] ?? 30));
-
-        if (!$date) {
-            $errors[] = 'Please select a date.';
-        } elseif ($date < date('Y-m-d')) {
-            $errors[] = 'Date cannot be in the past.';
-        } elseif ($time && $endTime && $endTime <= $time) {
-            $errors[] = 'End time must be after the start time.';
-        } else {
-            try {
-                $db->prepare(
-                    'INSERT INTO interview_slots (slot_date, slot_time, end_time, capacity, created_by)
-                     VALUES (?, ?, ?, ?, ?)'
-                )->execute([$date, $time, $endTime, $capacity, $staffId]);
-                $success[] = 'Session added for ' . format_date($date) . '.';
-            } catch (PDOException) {
-                $errors[] = 'Could not create session. Please try again.';
-            }
-        }
+// Graceful schema upgrade: ensure new columns exist on interview_slots.
+// (Desks have been merged into sessions — assigned_to/location_label/location_notes
+// live directly on interview_slots now.)
+foreach ([
+    ['assigned_to',    'INT(10) UNSIGNED DEFAULT NULL AFTER created_by'],
+    ['location_label', 'VARCHAR(120) NOT NULL DEFAULT "" AFTER assigned_to'],
+    ['location_notes', 'TEXT DEFAULT NULL AFTER location_label'],
+] as $col) {
+    try { $db->query("SELECT {$col[0]} FROM interview_slots LIMIT 0"); }
+    catch (\Throwable $e) {
+        try { $db->exec("ALTER TABLE interview_slots ADD COLUMN {$col[0]} {$col[1]}"); }
+        catch (\Throwable $e2) {}
     }
 }
 
-// ----------------------------------------------------------------
-// Desk info
-// ----------------------------------------------------------------
-$deskStmt = $db->prepare('SELECT desk_label, desk_notes FROM users WHERE id=?');
-$deskStmt->execute([$staffId]);
-$deskRow   = $deskStmt->fetch();
-$deskLabel = $deskRow['desk_label'] ?? '';
-$deskNotes = $deskRow['desk_notes'] ?? '';
-
-// ----------------------------------------------------------------
-// Load sessions
-// ----------------------------------------------------------------
-$showPast = isset($_GET['past']);
-$today    = date('Y-m-d');
-
-if ($showPast) {
-    $stmt = $db->prepare(
-        'SELECT s.*,
-                COUNT(q.id)                    AS booked,
-                SUM(q.status = "in_progress")  AS in_progress,
-                SUM(q.status = "completed")    AS completed,
-                SUM(q.status = "no_show")      AS no_show
-         FROM   interview_slots s
-         LEFT JOIN interview_queue q ON q.slot_id = s.id
-         WHERE  s.created_by = ? AND s.slot_date < ?
-         GROUP BY s.id
-         ORDER BY s.slot_date DESC, s.slot_time DESC
-         LIMIT 60'
-    );
-    $stmt->execute([$staffId, $today]);
-} else {
-    $stmt = $db->prepare(
-        'SELECT s.*, s.end_time,
-                COUNT(q.id)                    AS booked,
-                SUM(q.status = "checked_in")   AS waiting,
-                SUM(q.status = "in_progress")  AS in_progress,
-                SUM(q.status = "completed")    AS completed,
-                SUM(q.status = "no_show")      AS no_show
-         FROM   interview_slots s
-         LEFT JOIN interview_queue q ON q.slot_id = s.id
-         WHERE  s.created_by = ? AND s.slot_date >= ?
-         GROUP BY s.id
-         ORDER BY s.slot_date ASC, s.slot_time ASC
-         LIMIT 200'
-    );
-    $stmt->execute([$staffId, $today]);
-}
-
-$slots  = $stmt->fetchAll();
-$byDate = [];
-foreach ($slots as $slot) {
-    $byDate[$slot['slot_date']][] = $slot;
-}
-
-// ----------------------------------------------------------------
-// Helper: has this slot passed its end time?
-// ----------------------------------------------------------------
-function slot_is_expired(string $date, ?string $endTime, string $today, string $nowTime): bool {
-    if ($date < $today) return true;
-    if ($date === $today && $endTime !== null && $nowTime >= $endTime) return true;
-    return false;
-}
-
-// Check for today's sessions independently of which tab is shown
-$todayStmt = $db->prepare(
-    'SELECT COUNT(*) FROM interview_slots WHERE created_by = ? AND slot_date = ?'
+// Stats for landing cards
+$upcomingStmt = $db->prepare(
+    'SELECT COUNT(*) FROM interview_slots WHERE slot_date >= ?'
 );
-$todayStmt->execute([$staffId, $today]);
-$hasToday = (int)$todayStmt->fetchColumn() > 0;
+$upcomingStmt->execute([$today]);
+$totalUpcoming = (int)$upcomingStmt->fetchColumn();
+
+$totalSessionsStmt = $db->prepare('SELECT COUNT(*) FROM interview_slots');
+$totalSessionsStmt->execute();
+$totalSessions = (int)$totalSessionsStmt->fetchColumn();
+
+// Queue stats for today (across sessions this staff is the interviewer for,
+// falling back to created_by for legacy rows that have no assigned_to).
+$todayWaiting = 0;
+$todayInProgress = 0;
+$todayStmt = $db->prepare(
+    'SELECT SUM(q.status = "checked_in") AS waiting,
+            SUM(q.status = "in_progress") AS in_progress
+     FROM   interview_queue q
+     JOIN   interview_slots s ON s.id = q.slot_id
+     WHERE  s.slot_date = ?
+       AND  COALESCE(s.assigned_to, s.created_by) = ?'
+);
+$todayStmt->execute([$today, $staffId]);
+$todayRow = $todayStmt->fetch();
+if ($todayRow) {
+    $todayWaiting    = (int)($todayRow['waiting'] ?? 0);
+    $todayInProgress = (int)($todayRow['in_progress'] ?? 0);
+}
+$todayActive = $todayWaiting + $todayInProgress;
 
 ob_start();
 ?>
-
-<?php foreach ($errors as $e): ?>
-    <div class="alert alert-error" style="margin-bottom:var(--space-4)"><?= e($e) ?></div>
-<?php endforeach; ?>
-<?php foreach ($success as $s): ?>
-    <div class="alert alert-success" style="margin-bottom:var(--space-4)"><?= e($s) ?></div>
-<?php endforeach; ?>
-
-<!-- ================================================================
-     TAB STRIP
-================================================================ -->
-<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--space-5)">
-    <div style="display:flex;gap:0;border:1px solid var(--border);border-radius:var(--radius-md);
-                 overflow:hidden;background:var(--bg-elevated)">
-        <?php if ($hasToday): ?>
-            <a href="<?= url('/staff/interviews/queue') ?>"
-               style="padding:var(--space-2) var(--space-4);font-size:var(--text-sm);
-                      text-decoration:none;color:var(--text-secondary);
-                      display:flex;align-items:center;gap:var(--space-2);
-                      border-right:1px solid var(--border)">
-                <span style="display:inline-block;width:6px;height:6px;border-radius:50%;
-                              background:var(--accent);animation:pulse-dot 1.8s ease-in-out infinite"></span>
-                Live Queue
-            </a>
-        <?php endif; ?>
-        <a href="<?= url('/staff/interviews') ?>"
-           style="padding:var(--space-2) var(--space-4);font-size:var(--text-sm);
-                  text-decoration:none;border-right:1px solid var(--border);
-                  <?= !$showPast ? 'background:var(--bg-subtle);color:var(--text-primary);font-weight:var(--weight-medium)' : 'color:var(--text-secondary)' ?>">
-            Upcoming
-        </a>
-        <a href="?past=1"
-           style="padding:var(--space-2) var(--space-4);font-size:var(--text-sm);
-                  text-decoration:none;
-                  <?= $showPast ? 'background:var(--bg-subtle);color:var(--text-primary);font-weight:var(--weight-medium)' : 'color:var(--text-secondary)' ?>">
-            Past
-        </a>
-    </div>
-
-    <?php if (!$showPast): ?>
-        <button class="btn btn-primary btn-sm"
-                onclick="document.getElementById('add-session-modal').style.display='flex'">
-            + Add Session
-        </button>
-    <?php endif; ?>
-</div>
 
 <style>
     @keyframes pulse-dot {
         0%,100%{opacity:1;transform:scale(1)}
         50%{opacity:.5;transform:scale(1.3)}
     }
+    .intv-landing-wrap {
+        display:flex;align-items:center;justify-content:center;
+        min-height:calc(100vh - 200px);padding-bottom:var(--space-16);
+    }
+    .intv-landing-grid {
+        display:grid;grid-template-columns:1fr 1fr;gap:var(--space-6);
+        max-width:640px;width:100%;
+    }
+    .intv-landing-card {
+        display:flex;flex-direction:column;align-items:center;text-align:center;
+        gap:var(--space-4);padding:var(--space-10) var(--space-6);
+        background:var(--bg-elevated);border:1.5px solid var(--border);
+        border-radius:var(--radius-lg);text-decoration:none;color:var(--text-primary);
+        transition:border-color .18s,box-shadow .18s,transform .15s;cursor:pointer;
+    }
+    .intv-landing-card:hover {
+        border-color:var(--accent);box-shadow:0 8px 24px rgba(0,0,0,.08);transform:translateY(-4px);
+    }
+    /* Disabled queue card — when no interview setup exists yet, the
+       Queue card has nothing to call from. We dim it, kill the hover
+       lift, and swap the cursor to "not-allowed" so the click obviously
+       goes nowhere. */
+    .intv-landing-card.is-disabled {
+        opacity:.55;cursor:not-allowed;
+        background:var(--bg-subtle);
+    }
+    .intv-landing-card.is-disabled:hover {
+        border-color:var(--border);box-shadow:none;transform:none;
+    }
+    .intv-landing-icon {
+        width:60px;height:60px;border-radius:var(--radius-lg);
+        background:var(--accent-muted);color:var(--accent);
+        display:flex;align-items:center;justify-content:center;flex-shrink:0;
+    }
+    .intv-landing-title {
+        font-size:var(--text-lg);font-weight:var(--weight-semibold);
+        color:var(--text-primary);letter-spacing:-0.2px;margin-top:var(--space-1);
+    }
+    .intv-landing-desc {
+        font-size:var(--text-sm);color:var(--text-secondary);line-height:1.55;
+        margin-top:var(--space-1);
+    }
+    .intv-landing-meta {
+        font-size:var(--text-xs);color:var(--text-tertiary);
+        display:flex;align-items:center;gap:var(--space-2);
+        justify-content:center;flex-wrap:wrap;margin-top:var(--space-2);
+    }
+    @media (max-width:640px) { .intv-landing-grid { grid-template-columns:1fr;max-width:320px; } }
 </style>
 
-<!-- ================================================================
-     DESK INFO CARD
-================================================================ -->
-<div class="card" style="padding:var(--space-5);margin-bottom:var(--space-5)">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:var(--space-4)">
-        <div>
-            <div style="font-size:var(--text-sm);font-weight:var(--weight-semibold)">Interview Desk</div>
-            <div style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:2px">
-                Students see this location after booking
-            </div>
-        </div>
-        <?php if ($deskLabel): ?>
-            <span class="badge badge-approved">Set</span>
-        <?php else: ?>
-            <span class="badge badge-rejected">Not set</span>
-        <?php endif; ?>
-    </div>
-    <form method="POST">
-        <?= csrf_field() ?>
-        <input type="hidden" name="action" value="update_desk">
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-3)">
-            <div>
-                <label class="form-label">Location <span style="color:var(--error)">*</span></label>
-                <input type="text" name="desk_label" class="form-control"
-                       value="<?= e($deskLabel) ?>"
-                       placeholder="e.g. Room 201 – Desk A">
-            </div>
-            <div>
-                <label class="form-label">
-                    Directions
-                    <span style="color:var(--text-tertiary);font-weight:400"> — optional</span>
-                </label>
-                <input type="text" name="desk_notes" class="form-control"
-                       value="<?= e($deskNotes) ?>"
-                       placeholder="e.g. 2nd floor, turn left">
-            </div>
-        </div>
-        <div style="margin-top:var(--space-3);display:flex;justify-content:flex-end">
-            <button type="submit" class="btn btn-secondary btn-sm">Save Desk Info</button>
-        </div>
-    </form>
-</div>
+<div class="intv-landing-wrap">
+<div class="intv-landing-grid">
 
-<!-- ================================================================
-     SESSIONS LIST
-================================================================ -->
-<?php if (empty($byDate)): ?>
-    <div style="text-align:center;padding:var(--space-16) var(--space-4);color:var(--text-tertiary)">
-        <div style="font-size:var(--text-sm)">
-            <?= $showPast ? 'No past sessions.' : 'No upcoming sessions yet.' ?>
+    <!-- Interview Setup (left) -->
+    <a href="<?= url('/staff/interviews/setup') ?>" class="intv-landing-card">
+        <div class="intv-landing-icon">
+            <?= icon('ic_fluent_settings_24_regular', 28) ?>
         </div>
-    </div>
-<?php else: ?>
-    <div style="display:flex;flex-direction:column;gap:var(--space-2)">
-    <?php foreach ($byDate as $date => $dateSlots): ?>
-
-        <!-- Date divider -->
-        <div style="display:flex;align-items:center;gap:var(--space-3);
-                     padding:var(--space-3) 0 var(--space-1);
-                     color:var(--text-tertiary);font-size:var(--text-xs);
-                     font-weight:var(--weight-medium);letter-spacing:.04em">
-            <span><?= format_date($date, 'l, F j, Y') ?></span>
-            <?php if ($date === $today): ?>
-                <span class="badge badge-info" style="letter-spacing:0">Today</span>
+        <div class="intv-landing-title">Interview Setup</div>
+        <div class="intv-landing-desc">
+            Schedule sessions and assign interviewers per college.
+        </div>
+        <div class="intv-landing-meta">
+            <?= icon('ic_fluent_calendar_ltr_24_regular', 13) ?>
+            <?= $totalUpcoming ?> upcoming session<?= $totalUpcoming !== 1 ? 's' : '' ?>
+            <?php if ($totalSessions !== $totalUpcoming): ?>
+                &nbsp;·&nbsp;
+                <?= $totalSessions ?> total
             <?php endif; ?>
-            <div style="flex:1;height:1px;background:var(--border)"></div>
         </div>
+    </a>
 
-        <?php foreach ($dateSlots as $slot):
-            $booked     = (int)$slot['booked'];
-            $capacity   = (int)$slot['capacity'];
-            $waiting    = (int)($slot['waiting']     ?? 0);
-            $inProgress = (int)($slot['in_progress'] ?? 0);
-            $completed  = (int)($slot['completed']   ?? 0);
-            $noShow     = (int)($slot['no_show']      ?? 0);
-            $nowTime    = date('H:i:s');
-            $isExpired  = slot_is_expired($date, $slot['end_time'] ?? null, $today, $nowTime);
-            $isClosed   = $slot['status'] === 'closed' || $isExpired;
-            $isFull     = $booked >= $capacity;
-            $canDelete  = $booked === 0;
-            $fillPct    = $capacity > 0 ? min(100, round(($booked / $capacity) * 100)) : 0;
-
-            // Build the time range label
-            $timeLabel = 'All day';
-            if ($slot['slot_time']) {
-                $timeLabel = format_time($slot['slot_time']);
-                if ($slot['end_time']) {
-                    $timeLabel .= ' – ' . format_time($slot['end_time']);
-                }
-            }
-        ?>
-            <div class="card" style="padding:var(--space-4) var(--space-5)">
-                <div style="display:flex;align-items:center;gap:var(--space-4)">
-
-                    <!-- Time range -->
-                    <div style="min-width:<?= $slot['end_time'] ? '140px' : '64px' ?>;font-size:var(--text-sm);
-                                 font-weight:var(--weight-medium);color:var(--text-secondary)">
-                        <?= $timeLabel ?>
-                    </div>
-
-                    <!-- Capacity + live stats -->
-                    <div style="flex:1;min-width:0">
-                        <div style="display:flex;align-items:baseline;gap:var(--space-2);margin-bottom:var(--space-2)">
-                            <span style="font-weight:var(--weight-semibold);font-size:var(--text-sm)"><?= $booked ?></span>
-                            <span style="color:var(--text-tertiary);font-size:var(--text-xs)">/ <?= $capacity ?></span>
-                            <?php if ($date === $today && ($inProgress + $waiting) > 0): ?>
-                                <span style="color:var(--text-tertiary);font-size:var(--text-xs)">·</span>
-                                <?php if ($inProgress): ?>
-                                    <span style="color:var(--accent);font-size:var(--text-xs)">● <?= $inProgress ?> in interview</span>
-                                <?php endif; ?>
-                                <?php if ($waiting): ?>
-                                    <span style="color:var(--text-secondary);font-size:var(--text-xs)"><?= $waiting ?> waiting</span>
-                                <?php endif; ?>
-                            <?php endif; ?>
-                        </div>
-                        <!-- Fill bar -->
-                        <div style="height:3px;border-radius:99px;background:var(--border);overflow:hidden">
-                            <div style="height:100%;width:<?= $fillPct ?>%;border-radius:99px;
-                                         background:<?= $isClosed ? 'var(--border-strong)' : ($isFull ? 'var(--warning)' : 'var(--accent)') ?>;
-                                         transition:width .3s ease"></div>
-                        </div>
-                    </div>
-
-                    <!-- Status badge -->
-                    <?php if ($isExpired && $slot['status'] !== 'closed'): ?>
-                        <span class="badge badge-neutral">Ended</span>
-                    <?php elseif ($isClosed): ?>
-                        <span class="badge badge-neutral">Closed</span>
-                    <?php elseif ($isFull): ?>
-                        <span class="badge badge-review">Full</span>
-                    <?php else: ?>
-                        <span class="badge badge-approved">Open</span>
-                    <?php endif; ?>
-
-                    <!-- Actions -->
-                    <div style="display:flex;align-items:center;gap:var(--space-1)">
-
-                        <?php if (!$isExpired): ?>
-                        <form method="POST" action="<?= url('/staff/interviews/' . $slot['id']) ?>">
-                            <?= csrf_field() ?>
-                            <input type="hidden" name="action"
-                                   value="<?= $slot['status'] === 'closed' ? 'open_slot' : 'close_slot' ?>">
-                            <button class="btn btn-ghost btn-sm">
-                                <?= $slot['status'] === 'closed' ? 'Reopen' : 'Close' ?>
-                            </button>
-                        </form>
-                        <?php endif; ?>
-
-                        <?php if ($canDelete): ?>
-                            <form method="POST" action="<?= url('/staff/interviews/' . $slot['id']) ?>"
-                                  onsubmit="return confirm('Delete this session?')">
-                                <?= csrf_field() ?>
-                                <input type="hidden" name="action" value="delete_slot">
-                                <button class="btn-icon" style="color:var(--text-tertiary);padding:var(--space-1)"
-                                        title="Delete session">
-<?= icon('ic_fluent_delete_24_regular', 14) ?>
-                                </button>
-                            </form>
-                        <?php endif; ?>
-                    </div>
-                </div>
-            </div>
-        <?php endforeach; ?>
-    <?php endforeach; ?>
-    </div>
-<?php endif; ?>
-
-<!-- ================================================================
-     ADD SESSION MODAL
-================================================================ -->
-<div id="add-session-modal" class="modal-backdrop" style="display:none">
-    <div class="modal" style="max-width:360px">
-        <div class="modal-header">
-            <div class="modal-title">New Session</div>
-            <button class="btn-icon"
-                    onclick="document.getElementById('add-session-modal').style.display='none'">
-<?= icon('ic_fluent_dismiss_24_regular', 16) ?>
-            </button>
+    <!-- Interview Queue (right) -->
+    <?php
+        // No interview sessions at all means setup hasn't happened yet,
+        // and the Queue page has literally nothing to drive — disable
+        // the card and route the click into Setup so the user is led
+        // through the only useful next step.
+        $queueDisabled = ($totalSessions === 0);
+        $queueHref     = $queueDisabled
+            ? url('/staff/interviews/setup')
+            : url('/staff/interviews/queue');
+        $queueClasses  = 'intv-landing-card' . ($queueDisabled ? ' is-disabled' : '');
+        $queueTitle    = $queueDisabled
+            ? 'Set up interview sessions before opening the queue.'
+            : '';
+    ?>
+    <a href="<?= e($queueHref) ?>" class="<?= e($queueClasses) ?>"
+       <?php if ($queueDisabled): ?>aria-disabled="true" title="<?= e($queueTitle) ?>"<?php endif; ?>>
+        <div class="intv-landing-icon">
+            <?php if ($todayActive > 0 && !$queueDisabled): ?>
+                <span style="display:inline-block;width:10px;height:10px;border-radius:50%;
+                              background:var(--accent);animation:pulse-dot 1.8s ease-in-out infinite;
+                              position:absolute;top:12px;right:12px"></span>
+            <?php endif; ?>
+            <?= icon('ic_fluent_people_24_regular', 28) ?>
         </div>
-        <form method="POST">
-            <?= csrf_field() ?>
-            <input type="hidden" name="action" value="create_slot">
-            <div class="modal-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
+        <div class="intv-landing-title">Interview Queue</div>
+        <div class="intv-landing-desc">
+            <?php if ($queueDisabled): ?>
+                Set up sessions first to start calling students.
+            <?php else: ?>
+                Call students and record evaluations.
+            <?php endif; ?>
+        </div>
+        <div class="intv-landing-meta">
+            <?php if ($queueDisabled): ?>
+                <?= icon('ic_fluent_lock_closed_24_regular', 13) ?>
+                Setup required
+            <?php elseif ($todayActive > 0): ?>
+                <span style="display:inline-block;width:6px;height:6px;border-radius:50%;
+                              background:var(--accent);animation:pulse-dot 1.8s ease-in-out infinite"></span>
+                <?= $todayWaiting ?> waiting · <?= $todayInProgress ?> in progress
+            <?php else: ?>
+                <?= icon('ic_fluent_people_24_regular', 13) ?>
+                No active interviews
+            <?php endif; ?>
+        </div>
+    </a>
 
-                <div>
-                    <label class="form-label">Date <span style="color:var(--error)">*</span></label>
-                    <input type="date" name="slot_date" class="form-control"
-                           min="<?= date('Y-m-d') ?>" required>
-                </div>
-
-                <div>
-                    <label class="form-label">
-                        Start Time
-                        <span style="color:var(--text-tertiary);font-weight:400"> — optional</span>
-                    </label>
-                    <input type="time" name="slot_time" class="form-control" id="modal-start-time">
-                    <p style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:var(--space-1)">
-                        Leave blank if students can arrive any time that day
-                    </p>
-                </div>
-
-                <div>
-                    <label class="form-label">
-                        End Time
-                        <span style="color:var(--text-tertiary);font-weight:400"> — optional</span>
-                    </label>
-                    <input type="time" name="slot_end_time" class="form-control" id="modal-end-time">
-                    <p style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:var(--space-1)">
-                        Session automatically closes to new check-ins after this time
-                    </p>
-                </div>
-
-                <div>
-                    <label class="form-label">Capacity <span style="color:var(--error)">*</span></label>
-                    <input type="number" name="capacity" class="form-control"
-                           value="<?= INTERVIEW_DAILY_CAP ?>" min="1" max="500" required>
-                    <p style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:var(--space-1)">
-                        Recommended: 40–50 per day. Admin-configured max: <?= (int) school_setting('interview_daily_cap', INTERVIEW_DAILY_CAP) ?>.
-                    </p>
-                </div>
-
-            </div>
-            <div class="modal-footer">
-                <button type="button" class="btn btn-ghost"
-                        onclick="document.getElementById('add-session-modal').style.display='none'">
-                    Cancel
-                </button>
-                <button type="submit" class="btn btn-primary">Add Session</button>
-            </div>
-        </form>
-    </div>
+</div>
 </div>
 
 <?php

@@ -101,7 +101,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $errors['email']      = 'Enter a valid email address.';
     if (!in_array($old['applicant_type'], [TYPE_FRESHMAN, TYPE_TRANSFEREE, TYPE_FOREIGN], true))
         $errors['applicant_type'] = 'Select an applicant type.';
-    if (!in_array($old['course_applied'], PLP_COURSES, true))
+    if (!in_array($old['course_applied'], get_all_courses(), true))
         $errors['course_applied'] = 'Select a valid course.';
     elseif (!empty($old['course_applied'])) {
         // Check course cap at registration time
@@ -134,7 +134,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (empty($old['shs_strand'])) {
             $errors['shs_strand'] = 'Select your SHS strand.';
         } elseif (!empty($old['course_applied'])) {
-            $allowedStrands = COURSE_STRAND_MAP[$old['course_applied']] ?? null;
+            $allowedStrands = get_all_strand_map()[$old['course_applied']] ?? null;
             if ($allowedStrands !== null && !in_array($old['shs_strand'], $allowedStrands, true)) {
                 $errors['shs_strand'] = 'Your strand (' . $old['shs_strand'] . ') is not accepted for '
                     . $old['course_applied'] . '. Accepted: ' . implode(', ', $allowedStrands) . '.';
@@ -149,7 +149,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if ($check->fetch()) $errors['email'] = 'An account with this email already exists.';
     }
 
+    // Duplicate applicant detection (same name + birthdate)
     if (empty($errors)) {
+        $dupCheck = db()->prepare(
+            'SELECT u.id FROM users u
+             WHERE UPPER(u.first_name) = UPPER(?) AND UPPER(u.last_name) = UPPER(?) AND u.birthdate = ?
+             LIMIT 1'
+        );
+        $dupCheck->execute([$old['first_name'], $old['last_name'], $old['birthdate']]);
+        if ($dupCheck->fetch()) {
+            $errors['general'] = 'An applicant with the same name and birthdate already exists. If this is you, please use your existing account or contact the admissions office.';
+        }
+    }
+
+    if (empty($errors)) {
+        // Force uppercase on name fields
+        $old['first_name']    = mb_strtoupper($old['first_name']);
+        $old['middle_name']   = mb_strtoupper($old['middle_name']);
+        $old['last_name']     = mb_strtoupper($old['last_name']);
+        $old['suffix']        = mb_strtoupper($old['suffix']);
+        $old['street_address']= mb_strtoupper($old['street_address']);
+
         $parts = array_filter([
             $old['first_name'],
             $old['middle_name'] ?: null,
@@ -164,11 +184,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $pdo->beginTransaction();
 
         try {
+            $department = course_to_department($old['course_applied']);
+
             $stmt = $pdo->prepare(
                 'INSERT INTO users
                     (name, first_name, middle_name, last_name, suffix,
-                     birthdate, sex, address, phone, email, password_hash, role)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                     birthdate, sex, address, phone, email, password_hash, role, department)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
             );
             $stmt->execute([
                 $displayName,
@@ -183,6 +205,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $old['email'],
                 password_hash($password, PASSWORD_BCRYPT, ['cost' => 12]),
                 ROLE_STUDENT,
+                $department,
             ]);
             $userId = (int) $pdo->lastInsertId();
 
@@ -211,15 +234,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             $pdo->commit();
 
-            $user = $pdo->prepare('SELECT * FROM users WHERE id = ? LIMIT 1');
-            $user->execute([$userId]);
-            Auth::login($user->fetch());
+            // Log the department assignment so auditors can trace
+            // course → college decisions after the fact.
+            if ($department !== '') {
+                audit_log(
+                    'user_department_assigned',
+                    "Registered user #{$userId} assigned to {$department} from course '" . $old['course_applied'] . "'",
+                    'user',
+                    $userId
+                );
+            }
 
-            Session::flash('success', 'Account created successfully. Please upload your documents to continue.');
-            redirect('/student/documents');
+            // Send verification email — both magic link and 6-digit code
+            $verifyCreds = generate_verify_credentials($userId);
+            send_verification_email($old['email'], $displayName, $verifyCreds['token'], $verifyCreds['code']);
+
+            // Don't auto-login — require email verification first.
+            // Stash the email so /verify-pending can pre-fill the form.
+            Session::set('verify_pending_email', $old['email']);
+            Session::flash('success', 'Account created! Check your email for a verification code.');
+            redirect('/verify-pending');
 
         } catch (Throwable $e) {
-            $pdo->rollBack();
+            // The transaction may already be committed (e.g. a failure in the
+            // post-commit verification email step). Only roll back if there's
+            // still an active transaction.
+            if ($pdo->inTransaction()) {
+                try { $pdo->rollBack(); } catch (\Throwable) { /* ignore */ }
+            }
             error_log('Registration error: ' . $e->getMessage());
             $errors['general'] = 'Something went wrong. Please try again.';
         }
@@ -325,7 +367,7 @@ ob_start();
                 class="form-select <?= isset($errors['course_applied']) ? 'error' : '' ?>" required
                 onchange="onCourseChange(this.value)">
                 <option value="">Select…</option>
-                <?php foreach (PLP_COURSES as $course):
+                <?php foreach (get_all_courses() as $course):
                     $isFull = in_array($course, $fullCourses, true);
                 ?>
                     <option value="<?= e($course) ?>"
@@ -557,7 +599,7 @@ ob_start();
 </div>
 
 <script>
-const strandMap  = <?= json_encode(COURSE_STRAND_MAP) ?>;
+const strandMap  = <?= json_encode(get_all_strand_map()) ?>;
 const allStrands = <?= json_encode(SHS_STRANDS) ?>;
 
 function setSex(val) {
@@ -696,7 +738,7 @@ function togglePw(id, btn) {
     width: 48px;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    background: var(--bg-primary);
+    background: var(--bg-elevated);
     color: var(--text-secondary);
     font-size: var(--text-sm);
     font-weight: var(--weight-medium);
@@ -708,10 +750,10 @@ function togglePw(id, btn) {
     color: #fff;
     border-color: var(--accent);
 }
-.sex-toggle.error .sex-btn { border-color: var(--color-error, #e53e3e); }
+.sex-toggle.error .sex-btn { border-color: var(--error); }
 
 .qual-box {
-    background: var(--bg-secondary);
+    background: var(--bg-subtle);
     border: 1px solid var(--border);
     border-left: 3px solid var(--accent);
     border-radius: var(--radius-md);

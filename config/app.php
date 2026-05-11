@@ -4,6 +4,23 @@
 // Application-wide constants
 // ============================================================
 
+// -- Load .env file (local secrets) ------------------------------
+(function () {
+    $envFile = dirname(__DIR__) . '/.env';
+    if (!file_exists($envFile)) return;
+    foreach (file($envFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
+        $line = trim($line);
+        if ($line === '' || $line[0] === '#') continue;
+        if (strpos($line, '=') === false) continue;
+        [$key, $val] = explode('=', $line, 2);
+        $key = trim($key);
+        $val = trim($val);
+        if (!getenv($key)) {
+            putenv("$key=$val");
+        }
+    }
+})();
+
 // -- Environment -------------------------------------------------
 define('APP_ENV', getenv('APP_ENV') ?: 'development');   // 'development' | 'production'
 define('APP_DEBUG', APP_ENV === 'development');
@@ -21,7 +38,10 @@ define('UPLOAD_PATH', PUBLIC_PATH . '/uploads');
 if (APP_ENV === 'production') {
     define('BASE_URL', rtrim(getenv('APP_URL') ?: 'https://plp-admissions.vercel.app', '/'));
 } else {
-    $__scheme = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $__forwarded = $_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '';
+    $__scheme = ($__forwarded === 'https'
+        || (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off'))
+        ? 'https' : 'http';
     $__host   = $_SERVER['HTTP_HOST'] ?? 'localhost';
     $__script = $_SERVER['SCRIPT_NAME'] ?? '/plp-admissions/public/index.php';
     $__base   = rtrim(dirname(dirname($__script)), '/\\');
@@ -40,9 +60,19 @@ define('MAX_UPLOAD_BYTES', 5 * 1024 * 1024);
 define('ALLOWED_MIME_TYPES', ['application/pdf', 'image/jpeg', 'image/png', 'image/webp']);
 
 // -- Roles -------------------------------------------------------
-define('ROLE_STUDENT', 'student');
-define('ROLE_STAFF',   'staff');
-define('ROLE_ADMIN',   'admin');
+// DB enum values stored on users.role:
+//   'student' | 'staff' | 'sso' | 'dean' | 'admin'
+//
+// ROLE_STAFF and ROLE_PROFESSOR both refer to the 'staff' enum value —
+// "Professor" is just the user-facing label for legacy 'staff' rows
+// (faculty who proctor exams and conduct interviews). SSO and Dean are
+// new top-level roles introduced for the role-redesign rollout.
+define('ROLE_STUDENT',   'student');
+define('ROLE_STAFF',     'staff');
+define('ROLE_PROFESSOR', 'staff');     // alias — DB enum stays 'staff'
+define('ROLE_SSO',       'sso');
+define('ROLE_DEAN',      'dean');
+define('ROLE_ADMIN',     'admin');
 
 // -- Applicant types ---------------------------------------------
 define('TYPE_FRESHMAN',   'freshman');
@@ -104,6 +134,42 @@ define('PLP_COURSES', [
     'BS Nursing (BSN)',
 ]);
 
+// -- Departments / Colleges -------------------------------------
+// Keep the canonical name in sync with `departments.name` (DB).
+define('DEPT_CCS', 'College of Computer Studies');
+define('DEPT_CON', 'College of Nursing');
+define('DEPT_CBA', 'College of Business and Accountancy');
+define('DEPT_COE', 'College of Education');
+define('DEPT_CAS', 'College of Arts and Sciences');
+define('DEPT_CEN', 'College of Engineering');
+
+define('PLP_DEPARTMENTS', [
+    DEPT_CCS,
+    DEPT_CON,
+    DEPT_CBA,
+    DEPT_COE,
+    DEPT_CAS,
+    DEPT_CEN,
+]);
+
+// Course → department mapping.  This is the config-level fallback;
+// the `course_departments` DB table is the source of truth once seeded.
+define('COURSE_DEPARTMENT_MAP', [
+    'BS Information Technology (BSIT)'                                  => DEPT_CCS,
+    'BS Computer Science (BSCS)'                                        => DEPT_CCS,
+    'BS Nursing (BSN)'                                                  => DEPT_CON,
+    'BS Accountancy (BSA)'                                              => DEPT_CBA,
+    'BS Business Administration major in Marketing Management (BSBA)'   => DEPT_CBA,
+    'BS Entrepreneurship (BSENT)'                                       => DEPT_CBA,
+    'BS Hospitality Management (BSHM)'                                  => DEPT_CBA,
+    'Bachelor of Elementary Education (BEED)'                           => DEPT_COE,
+    'Bachelor of Secondary Education Major in English (BSED-ENG)'       => DEPT_COE,
+    'Bachelor of Secondary Education Major in Filipino (BSED-FIL)'      => DEPT_COE,
+    'Bachelor of Secondary Education Major in Mathematics (BSED-MATH)'  => DEPT_COE,
+    'AB Psychology (AB Psych)'                                          => DEPT_CAS,
+    'BS Electronics Engineering (BSECE)'                                => DEPT_CEN,
+]);
+
 // -- Strand requirements per course (freshmen only) --------------
 // Applicants should apply only to courses where their SHS strand is applicable.
 define('COURSE_STRAND_MAP', [
@@ -123,6 +189,11 @@ define('COURSE_STRAND_MAP', [
 ]);
 
 // -- All SHS strands (for the registration dropdown) -------------
+// Only strands accepted by at least one course in COURSE_STRAND_MAP are listed.
+// TVL-IA, Arts Track, and Sports Track are valid DepEd strands but PLP currently
+// has no courses that accept them — they have been removed to prevent applicants
+// from hitting a registration dead-end. Add them back here and to COURSE_STRAND_MAP
+// if PLP adds a qualifying course in a future school year.
 define('SHS_STRANDS', [
     'ABM'        => 'ABM — Accountancy, Business and Management',
     'STEM'       => 'STEM — Science, Technology, Engineering and Mathematics',
@@ -131,9 +202,6 @@ define('SHS_STRANDS', [
     'TVL-HE'     => 'TVL — Home Economics',
     'TVL-ICT'    => 'TVL — Information and Communications Technology',
     'TVL-Sports' => 'TVL — Sports',
-    'TVL-IA'     => 'TVL — Industrial Arts',
-    'Arts'       => 'Arts and Design Track',
-    'Sports'     => 'Sports Track',
 ]);
 
 // -- Document status labels -------------------------------------
@@ -146,10 +214,14 @@ define('DOC_STATUS_LABELS', [
 ]);
 
 // -- Admission result labels ------------------------------------
+// Waitlist tier was retired in the role redesign — the only outcomes
+// are Accepted or Rejected (a Professor's interview Fail blocks
+// acceptance entirely). Legacy 'waitlisted' rows in the DB still
+// render as "Waitlisted (legacy)" via the fallback in pages that
+// read this constant.
 define('RESULT_LABELS', [
-    'accepted'   => 'Accepted',
-    'waitlisted' => 'Waitlisted',
-    'rejected'   => 'Rejected',
+    'accepted' => 'Accepted',
+    'rejected' => 'Rejected',
 ]);
 
 // ----------------------------------------------------------------
@@ -158,7 +230,6 @@ define('RESULT_LABELS', [
 define('EXAM_DEFAULT_DURATION',   90);   // 1 hr 30 min default (customizable)
 define('EXAM_ROOM_CAPACITY',      35);   // max applicants per room
 define('EXAM_DAILY_CAP',        3000);   // max applicants per day (all courses)
-define('INTERVIEW_DAILY_CAP',     45);   // max per day (40-50 range; 45 default)
 
 // ----------------------------------------------------------------
 // PER-COURSE PASSING SCORE TIERS
@@ -194,15 +265,23 @@ define('COURSE_PASSING_SCORES', [
     'BS Nursing (BSN)'                                                   => ['pass_from' => 4, 'confirmed' => false],
 ]);
 
-// -- Uploadcare (file storage) -----------------------------------
-define('UPLOADCARE_PUB_KEY',    getenv('UPLOADCARE_PUB_KEY')    ?: '');
-define('UPLOADCARE_SECRET_KEY', getenv('UPLOADCARE_SECRET_KEY') ?: '');
-define('UPLOADCARE_ENABLED',    !empty(UPLOADCARE_PUB_KEY));
-
 // -- hCaptcha ----------------------------------------------------
 define('HCAPTCHA_SITE_KEY',   getenv('HCAPTCHA_SITE_KEY')   ?: '');
 define('HCAPTCHA_SECRET_KEY', getenv('HCAPTCHA_SECRET_KEY') ?: '');
 define('HCAPTCHA_ENABLED',    !empty(HCAPTCHA_SITE_KEY) && !empty(HCAPTCHA_SECRET_KEY));
+
+// -- Email (Gmail SMTP via PHPMailer) -----------------------------
+define('SMTP_HOST',       getenv('SMTP_HOST')       ?: 'smtp.gmail.com');
+define('SMTP_PORT',       getenv('SMTP_PORT')       ?: 587);
+define('SMTP_USER',       getenv('SMTP_USER')       ?: '');
+define('SMTP_PASS',       getenv('SMTP_PASS')       ?: '');
+define('SMTP_FROM_NAME',  getenv('SMTP_FROM_NAME')  ?: 'PLP Admissions');
+define('SMTP_ENABLED',    !empty(SMTP_USER) && !empty(SMTP_PASS));
+
+// -- Email verification ------------------------------------------
+define('VERIFY_RESEND_COOLDOWN_SECS', 60);   // wait between resend requests
+define('VERIFY_CODE_TTL_SECS',        15 * 60);  // 15-minute code lifetime
+define('VERIFY_MAX_CODE_ATTEMPTS',    5);    // bad-code attempts per credential
 
 // -- Progress steps (student tracker) ---------------------------
 define('PROGRESS_STEPS', [

@@ -25,6 +25,13 @@ $docRows = array_column($stmt->fetchAll(), null, 'doc_type');
 
 $requiredDocs = docs_for_type($applicant['applicant_type']);
 
+// Document deadline enforcement
+$docDeadlineStr = school_setting('document_deadline', '');
+$docDeadlinePassed = false;
+if ($docDeadlineStr) {
+    $docDeadlinePassed = (new DateTime())->format('Y-m-d') > $docDeadlineStr;
+}
+
 $errors   = [];
 $success  = [];
 
@@ -37,6 +44,17 @@ $isAjax = !empty($_SERVER['HTTP_X_REQUESTED_WITH'])
 // ----------------------------------------------------------------
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     csrf_check();
+
+    // Block all document submissions after the deadline
+    if ($docDeadlinePassed && !$isSubmitted) {
+        $errors[] = 'The document submission deadline has passed.';
+        if ($isAjax) {
+            header('Content-Type: application/json');
+            echo json_encode(['ok' => false, 'message' => $errors[0]]);
+            exit;
+        }
+        redirect('/student/documents');
+    }
 
     $action = $_POST['action'] ?? 'upload';
 
@@ -87,6 +105,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             header('Content-Type: application/json');
             echo json_encode(['ok' => empty($errors), 'message' => empty($errors) ? 'Submission withdrawn.' : implode(' ', $errors)]);
             exit;
+        }
+        redirect('/student/documents');
+    }
+
+    // ---- Change applicant type ----
+    if ($action === 'change_type') {
+        $newType = trim($_POST['applicant_type'] ?? '');
+        $allowedTypes = ['freshman', 'transferee', 'foreign'];
+        if (!in_array($newType, $allowedTypes, true)) {
+            $errors[] = 'Invalid applicant type.';
+        } elseif ($isSubmitted || !in_array($applicant['overall_status'], ['documents'], true)) {
+            $errors[] = 'You can only change your applicant type before submitting documents.';
+        } else {
+            $db->prepare('UPDATE applicants SET applicant_type = ? WHERE id = ?')
+                ->execute([$newType, $applicantId]);
+            $applicant['applicant_type'] = $newType;
+            $requiredDocs = docs_for_type($newType);
+            audit_log('type_changed', "Applicant {$applicantId} changed type to {$newType}", 'applicant', $applicantId);
+            Session::flash('success', 'Applicant type updated. Please review the updated document requirements.');
         }
         redirect('/student/documents');
     }
@@ -157,6 +194,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $docRows = array_column($stmt->fetchAll(), null, 'doc_type');
 
             $success[] = $requiredDocs[$docSlug] . ' uploaded successfully.';
+
+            // Automation: auto-validate the uploaded document
+            $docId = $docRows[$docSlug]['id'] ?? 0;
+            $validationResult = 'uncertain';
+            if ($docId) {
+                $validationResult = auto_validate_document($docId);
+                if ($validationResult === 'passed') {
+                    // Re-fetch after auto-approval
+                    $stmt = $db->prepare('SELECT * FROM documents WHERE applicant_id = ?');
+                    $stmt->execute([$applicantId]);
+                    $docRows = array_column($stmt->fetchAll(), null, 'doc_type');
+                    $success[] = 'Document auto-validated and approved.';
+                }
+            }
         }
     }
 
@@ -164,7 +215,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($isAjax) {
         header('Content-Type: application/json');
         if (empty($errors)) {
-            echo json_encode(['ok' => true, 'message' => $success[0] ?? 'Uploaded successfully.']);
+            echo json_encode([
+                'ok' => true,
+                'message' => $success[0] ?? 'Uploaded successfully.',
+                'validation' => $validationResult ?? 'uncertain',
+                'auto_approved' => ($validationResult ?? '') === 'passed',
+            ]);
         } else {
             echo json_encode(['ok' => false, 'message' => implode(' ', $errors)]);
         }
@@ -181,8 +237,9 @@ $allApproved  = count($docRows) === count($requiredDocs)
 $uploadedOrApproved = ($statusCounts['uploaded'] ?? 0) + ($statusCounts['approved'] ?? 0);
 $allUploaded  = count($docRows) === count($requiredDocs) && $uploadedOrApproved === count($requiredDocs);
 $pastDocuments = in_array($applicant['overall_status'] ?? '', ['exam', 'interview', 'released'], true);
+$hasRejected   = ($statusCounts['rejected'] ?? 0) > 0;
 $canSubmit     = $allUploaded && !$isSubmitted && !$pastDocuments;
-$canWithdraw   = $isSubmitted && !$allApproved && !$pastDocuments;
+$canWithdraw   = $isSubmitted && !$allApproved && !$pastDocuments && !$hasRejected;
 
 // Stepper current step
 $stmt = $db->prepare('SELECT * FROM exam_results WHERE applicant_id=? LIMIT 1');
@@ -208,14 +265,18 @@ $openSessions    = [];
 $queuePosition   = null;
 
 if ($_examResult) {
-    // Load the student's booking with full slot details
+    // Load the student's booking with full slot details. After the
+    // desk/session merge, the interviewer + location both live on the slot.
     $stmt = $db->prepare(
         'SELECT q.*,
                 s.slot_date, s.slot_time, s.end_time, s.capacity,
-                u.name AS staff_name, u.desk_label, u.desk_notes
+                COALESCE(au.name, cu.name)                           AS staff_name,
+                COALESCE(NULLIF(s.location_label, ""), cu.desk_label) AS desk_label,
+                COALESCE(s.location_notes, cu.desk_notes)            AS desk_notes
          FROM   interview_queue q
          JOIN   interview_slots s ON s.id = q.slot_id
-         JOIN   users u           ON u.id = s.created_by
+         JOIN   users           cu ON cu.id = s.created_by
+         LEFT JOIN users        au ON au.id = s.assigned_to
          WHERE  q.applicant_id = ?
          LIMIT 1'
     );
@@ -264,12 +325,14 @@ if ($_examResult) {
         if ($iAction === 'checkin' && $myEntry && $myEntry['slot_date'] === date('Y-m-d') && $myEntry['status'] === 'scheduled') {
             $db->beginTransaction();
             try {
+                // After the desk/session merge, an interviewer is identified by
+                // assigned_to (with created_by fallback for legacy rows).
                 $stmt = $db->prepare(
                     'SELECT COALESCE(MAX(q.queue_number), 0) + 1
                      FROM   interview_queue q
                      JOIN   interview_slots s ON s.id = q.slot_id
-                     WHERE  s.slot_date = ? AND s.created_by = (
-                         SELECT created_by FROM interview_slots WHERE id = ?
+                     WHERE  s.slot_date = ? AND COALESCE(s.assigned_to, s.created_by) = (
+                         SELECT COALESCE(assigned_to, created_by) FROM interview_slots WHERE id = ?
                      ) AND q.queue_number IS NOT NULL'
                 );
                 $stmt->execute([date('Y-m-d'), $myEntry['slot_id']]);
@@ -289,10 +352,13 @@ if ($_examResult) {
             // Reload
             $stmt = $db->prepare(
                 'SELECT q.*, s.slot_date, s.slot_time, s.end_time, s.capacity,
-                        u.name AS staff_name, u.desk_label, u.desk_notes
+                        COALESCE(au.name, cu.name)                           AS staff_name,
+                        COALESCE(NULLIF(s.location_label, ""), cu.desk_label) AS desk_label,
+                        COALESCE(s.location_notes, cu.desk_notes)            AS desk_notes
                  FROM   interview_queue q
                  JOIN   interview_slots s ON s.id = q.slot_id
-                 JOIN   users u           ON u.id = s.created_by
+                 JOIN   users           cu ON cu.id = s.created_by
+                 LEFT JOIN users        au ON au.id = s.assigned_to
                  WHERE  q.applicant_id = ? LIMIT 1'
             );
             $stmt->execute([$applicantId]);
@@ -300,13 +366,19 @@ if ($_examResult) {
         }
     }
 
-    // Load open sessions if not booked yet
+    // Load open sessions if not booked yet. After the desk/session merge,
+    // location info lives on each session row, so no JOIN to a desks table.
     if (!$myEntry) {
         $nowTime = date('H:i:s');
         $stmt = $db->prepare(
-            'SELECT s.*, u.name AS staff_name, u.desk_label, u.desk_notes, COUNT(q.id) AS booked
+            'SELECT s.*,
+                    COALESCE(au.name, cu.name)                           AS staff_name,
+                    COALESCE(NULLIF(s.location_label, ""), cu.desk_label) AS desk_label,
+                    COALESCE(s.location_notes, cu.desk_notes)            AS desk_notes,
+                    COUNT(q.id) AS booked
              FROM   interview_slots s
-             JOIN   users u ON u.id = s.created_by
+             JOIN   users           cu ON cu.id = s.created_by
+             LEFT JOIN users        au ON au.id = s.assigned_to
              LEFT JOIN interview_queue q ON q.slot_id = s.id
              WHERE  s.slot_date >= ? AND s.status = "open"
                AND  NOT (s.slot_date = ? AND s.end_time IS NOT NULL AND s.end_time <= ?)
@@ -317,13 +389,14 @@ if ($_examResult) {
         $openSessions = $stmt->fetchAll();
     }
 
-    // Queue position
+    // Queue position — scoped to this interviewer's queue for today, using
+    // assigned_to with created_by fallback for legacy rows.
     if ($myEntry && $myEntry['status'] === 'checked_in') {
         $stmt = $db->prepare(
             'SELECT COUNT(*) FROM interview_queue q
              JOIN   interview_slots s ON s.id = q.slot_id
-             WHERE  s.slot_date = ? AND s.created_by = (
-                 SELECT created_by FROM interview_slots WHERE id = ?
+             WHERE  s.slot_date = ? AND COALESCE(s.assigned_to, s.created_by) = (
+                 SELECT COALESCE(assigned_to, created_by) FROM interview_slots WHERE id = ?
              ) AND q.status = "checked_in" AND q.queue_number < ?'
         );
         $stmt->execute([date('Y-m-d'), $myEntry['slot_id'], $myEntry['queue_number']]);
@@ -339,9 +412,40 @@ foreach ($requiredDocs as $slug => $label) {
         $viewableFiles[] = [
             'label'     => $label,
             'file_path' => $doc['file_path'],
-            'url'       => str_starts_with($doc['file_path'], 'http') ? $doc['file_path'] : url('/' . $doc['file_path']),
+            'url'       => file_url($doc['file_path']),
         ];
     }
+}
+
+// ----------------------------------------------------------------
+// Deadline-passed page for students who haven't submitted
+// ----------------------------------------------------------------
+if ($docDeadlinePassed && !$isSubmitted && !$pastDocuments) {
+    ob_start();
+    $deadlineFormatted = date('F j, Y', strtotime($docDeadlineStr));
+?>
+<div style="display:flex;align-items:center;justify-content:center;min-height:60vh">
+    <div style="text-align:center;max-width:480px;padding:var(--space-8)">
+        <div style="font-size:48px;margin-bottom:var(--space-4)">
+            <?= icon('ic_fluent_dismiss_circle_24_regular', 48) ?>
+        </div>
+        <h2 style="font-size:var(--text-xl);font-weight:var(--weight-semibold);margin-bottom:var(--space-3);color:var(--text-primary)">
+            Document Submission Closed
+        </h2>
+        <p style="font-size:var(--text-sm);color:var(--text-secondary);line-height:1.6;margin-bottom:var(--space-4)">
+            The deadline for submitting documents was <strong><?= e($deadlineFormatted) ?></strong>.
+            Unfortunately, we are no longer accepting document submissions for this admissions period.
+        </p>
+        <p style="font-size:var(--text-xs);color:var(--text-tertiary);line-height:1.5">
+            If you believe this is an error or have special circumstances, please contact the admissions office for assistance.
+        </p>
+    </div>
+</div>
+<?php
+    $content   = ob_get_clean();
+    $pageTitle = 'Document Submission Closed';
+    include VIEWS_PATH . '/layouts/app.php';
+    return;
 }
 
 // ----------------------------------------------------------------
@@ -369,30 +473,51 @@ ob_start();
 
 
 
+<?php if (!$isSubmitted && $applicant['overall_status'] === 'documents'): ?>
+<!-- Applicant type selector -->
+<div class="card" style="padding:var(--space-4) var(--space-5);margin-bottom:var(--space-4);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:var(--space-3)">
+    <div>
+        <span style="font-size:var(--text-xs);text-transform:uppercase;letter-spacing:.06em;color:var(--text-tertiary)">Applicant Type</span>
+        <div style="font-weight:var(--weight-semibold);font-size:var(--text-sm);text-transform:capitalize"><?= e($applicant['applicant_type']) ?></div>
+    </div>
+    <form method="POST" style="display:flex;align-items:center;gap:var(--space-2)">
+        <?= csrf_field() ?>
+        <input type="hidden" name="action" value="change_type">
+        <select name="applicant_type" class="form-select" style="width:auto;min-height:36px;font-size:var(--text-sm)">
+            <option value="freshman" <?= $applicant['applicant_type'] === 'freshman' ? 'selected' : '' ?>>Freshman</option>
+            <option value="transferee" <?= $applicant['applicant_type'] === 'transferee' ? 'selected' : '' ?>>Transferee</option>
+            <option value="foreign" <?= $applicant['applicant_type'] === 'foreign' ? 'selected' : '' ?>>Foreign</option>
+        </select>
+        <button type="submit" class="btn btn-ghost" style="min-height:36px;font-size:var(--text-sm)">Change</button>
+    </form>
+</div>
+<?php endif; ?>
+
 <!-- Document list -->
 <div style="display:flex;flex-direction:column;gap:var(--space-3)">
 <?php foreach ($requiredDocs as $slug => $label):
     $doc    = $docRows[$slug] ?? null;
     $status = $doc['status'] ?? 'pending';
     $statusMap = [
-        'pending'      => ['label' => 'Pending',      'class' => 'badge-pending'],
-        'uploaded'     => ['label' => 'Uploaded',     'class' => 'badge-info'],
-        'under_review' => ['label' => 'Under Review', 'class' => 'badge-warning'],
-        'approved'     => ['label' => 'Approved',     'class' => 'badge-success'],
-        'rejected'     => ['label' => 'Rejected',     'class' => 'badge-error'],
+        'pending'               => ['label' => 'Pending',              'class' => 'badge-pending'],
+        'uploaded'              => ['label' => 'Uploaded',             'class' => 'badge-info'],
+        'under_review'          => ['label' => 'Under Review',         'class' => 'badge-warning'],
+        'approved'              => ['label' => 'Approved',             'class' => 'badge-success'],
+        'rejected'              => ['label' => 'Rejected',             'class' => 'badge-error'],
+        'resubmission_required' => ['label' => 'Resubmission Required','class' => 'badge-error'],
     ];
     $badge      = $statusMap[$status] ?? $statusMap['pending'];
     $canUpload  = $isSubmitted
-        ? $status === 'rejected'
-        : in_array($status, ['pending', 'rejected', 'uploaded'], true);
-    $uploadLabel = $status === 'pending' ? 'Upload' : 'Replace';
+        ? in_array($status, ['rejected', 'resubmission_required'], true)
+        : in_array($status, ['pending', 'rejected', 'resubmission_required', 'uploaded'], true);
+    $uploadLabel = $status === 'pending' ? 'Upload' : 'Resubmit';
     $isApproved = $status === 'approved';
 ?>
     <div class="card" style="padding:var(--space-4) var(--space-5)">
         <div style="display:flex;align-items:center;gap:var(--space-4)">
 
             <!-- Icon -->
-            <div style="width:40px;height:40px;border-radius:var(--radius-md);background:var(--neutral-100);display:flex;align-items:center;justify-content:center;flex-shrink:0;<?= $isApproved ? 'background:var(--success-bg)' : '' ?>">
+            <div style="width:40px;height:40px;border-radius:var(--radius-md);background:var(--bg-subtle);display:flex;align-items:center;justify-content:center;flex-shrink:0;<?= $isApproved ? 'background:var(--success-bg)' : '' ?>">
                 <?php if ($isApproved): ?>
                     <?= icon('ic_fluent_checkmark_circle_24_regular', 18, 'color:var(--success)') ?>
                 <?php else: ?>
@@ -403,13 +528,32 @@ ob_start();
             <!-- Info -->
             <div style="flex:1;min-width:0">
                 <div style="font-weight:var(--weight-medium);color:var(--text-primary)"><?= e($label) ?></div>
-                <?php if ($doc && $doc['staff_remarks']): ?>
+                <?php if ($status === 'resubmission_required'): ?>
+                    <div style="font-size:var(--text-sm);color:var(--error);margin-top:2px;font-weight:var(--weight-semibold)">
+                        ⚠ Resubmission required<?php if ($doc && $doc['staff_remarks']): ?>: <?= e($doc['staff_remarks']) ?><?php endif; ?>
+                    </div>
+                    <div style="font-size:var(--text-xs);color:var(--warning);margin-top:2px">
+                        Please upload a corrected version of this document to continue your application.
+                    </div>
+                <?php elseif ($doc && $doc['staff_remarks']): ?>
                     <div style="font-size:var(--text-sm);color:var(--error);margin-top:2px">
                         Staff note: <?= e($doc['staff_remarks']) ?>
                     </div>
                 <?php elseif ($status === 'approved'): ?>
+                    <?php
+                    $autoValidated = false;
+                    if ($doc) {
+                        try {
+                            ensure_document_validations_table();
+                            $vStmt = db()->prepare('SELECT status FROM document_validations WHERE document_id = ? ORDER BY validated_at DESC LIMIT 1');
+                            $vStmt->execute([$doc['id']]);
+                            $vRow = $vStmt->fetch();
+                            $autoValidated = $vRow && $vRow['status'] === 'passed';
+                        } catch (\Throwable) {}
+                    }
+                    ?>
                     <div style="font-size:var(--text-sm);color:var(--text-tertiary);margin-top:2px">
-                        Approved by admissions staff
+                        <?= $autoValidated ? 'Auto-validated and approved' : 'Approved by admissions staff' ?>
                     </div>
                 <?php endif; ?>
             </div>
@@ -748,13 +892,7 @@ function updateDropLabel(name) {
                 will-change:transform;
                 transform-origin:center center;
             ">
-                <img id="fv-img" src="" alt="Document preview" style="
-                    max-width:100%;max-height:78vh;
-                    border-radius:var(--radius-sm);
-                    box-shadow:var(--shadow-md);
-                    display:block;pointer-events:none;
-                    user-select:none;-webkit-user-drag:none;
-                ">
+                <!-- content injected by _render() -->
             </div>
             <div id="fv-hint" style="
                 position:absolute;bottom:12px;left:50%;transform:translateX(-50%);
@@ -801,7 +939,7 @@ function updateDropLabel(name) {
     window.closeFileViewer = function() {
         document.getElementById('file-viewer-modal').style.display='none';
         document.body.style.overflow='';
-        document.getElementById('fv-img').src='';
+        document.getElementById('fv-transform-wrap').innerHTML='';
     };
 
     window.fvNavigate = function(d) {
@@ -821,7 +959,13 @@ function updateDropLabel(name) {
     function _render() {
         var f=_files[_idx];
         if(!f) return;
-        document.getElementById('fv-img').src=f.url;
+        var wrap=document.getElementById('fv-transform-wrap');
+        var isPdf=f.url.toLowerCase().split('?')[0].endsWith('.pdf');
+        if(isPdf){
+            wrap.innerHTML='<iframe src="'+f.url+'" style="width:100%;height:78vh;border:none;border-radius:var(--radius-sm);background:#fff;"></iframe>';
+        } else {
+            wrap.innerHTML='<img src="'+f.url+'" alt="Document preview" style="max-width:100%;max-height:78vh;border-radius:var(--radius-sm);box-shadow:var(--shadow-md);display:block;pointer-events:none;user-select:none;-webkit-user-drag:none;">';
+        }
         document.getElementById('fv-label').textContent=f.label;
         document.getElementById('fv-counter').textContent=(_idx+1)+' of '+_files.length;
         var p=document.getElementById('fv-prev');
