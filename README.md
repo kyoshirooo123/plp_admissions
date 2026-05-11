@@ -1,177 +1,85 @@
-# PLP Admissions System
+# PLP Admissions
 
-A web-based admissions management system for **Pamantasan ng Lungsod ng Pasig (PLP)**, built with PHP and MySQL. It handles the end-to-end admissions workflow — from student registration and document submission, to entrance exams, interviews, and results release.
+Pamantasan ng Lungsod ng Pasig — student admissions, document review,
+entrance exam, and interview scheduling system.
 
----
-
-## Tech Stack
-
-- **Backend:** PHP (vanilla, no framework)
-- **Database:** MySQL / MariaDB
-- **Frontend:** HTML, CSS, JavaScript
-- **Server:** Apache via XAMPP
+The interview module uses a single **Session** entity (the legacy
+`interview_desks` table has been merged into `interview_slots`); each
+session row carries `assigned_to`, `location_label`, and `location_notes`.
 
 ---
 
-## Requirements
+## Fresh install (new computer)
 
-- [XAMPP](https://www.apachefriends.org/) (Apache + MySQL)
-- PHP 8.0+
-- A modern web browser
+> **Back up your database first if one already exists** — `database/schema.sql`
+> drops every application table before recreating it.
 
----
+### 1. Drop the project into XAMPP
 
-## Local Setup
+Place the project at `xampp/htdocs/plp-admissions/` (or your preferred web
+root).
 
-### 1. Clone the Repository
+### 2. Load the database
 
-```bash
-git clone https://github.com/JjByteX/plp-admissions.git
-```
-
-Then copy the `plp-admissions` folder into your XAMPP web root:
+Create the `plp_admissions` database, then run **one** file:
 
 ```
-C:\xampp\htdocs\plp-admissions\
+mysql -u root -p plp_admissions < database/schema.sql
 ```
 
-Your directory should look like:
+…or, in phpMyAdmin: select the database → Import → choose
+`database/schema.sql` → Import.
+
+That single file:
+
+- Drops every application table (clean reset).
+- Creates the full schema, including the merged `interview_slots`
+  (with `assigned_to`, `location_label`, `location_notes`) — no separate
+  desk-merge migration needed.
+- Seeds default school settings, departments, courses, passing scores, and
+  an admin account.
+
+### 3. (Optional) Seed staff accounts
 
 ```
-C:\xampp\htdocs\plp-admissions\
-├── config\
-├── core\
-├── database\
-├── modules\
-├── public\
-└── views\
+mysql -u root -p plp_admissions < database/seed_users.sql
 ```
 
----
+### 4. (Optional) Delete the legacy include files
 
-### 2. Start XAMPP
+The setup page no longer uses these two files. They are harmless dead code,
+but if you want a clean tree you can delete them manually:
 
-Open the XAMPP Control Panel and start both:
-- **Apache**
-- **MySQL**
-
-Both should show green before continuing.
-
----
-
-### 3. Create the Database
-
-Open the XAMPP **Shell** and run:
-
-```bash
-mysql -u root -p
 ```
-
-Press **Enter** when prompted for a password (blank by default).
-
-Then run:
-
-```sql
-CREATE DATABASE plp_admissions CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-USE plp_admissions;
-source C:/xampp/htdocs/plp-admissions/database/schema.sql
-```
-
-You should see several `Query OK` messages. The schema will also create a default admin account (`admin@plp.edu.ph`).
-
----
-
-### 4. Set the Admin Password
-
-> ⚠️ The schema seeds the admin account with a **placeholder password hash**. You must update it before logging in.
-
-Still inside the MariaDB shell, run:
-
-```sql
-UPDATE users
-SET password_hash = '$2y$12$57QF.xJzIm..jLPxlA2TO.QqENIdI1HKzNFYiMA.zkossK5YwvfQC'
-WHERE email = 'admin@plp.edu.ph';
-```
-
-Then exit:
-
-```sql
-exit
+modules/interview/_setup_desks.php
+modules/interview/_setup_desk_schedule.php
 ```
 
 ---
 
-### 5. Open the System
+## Smoke test
 
-Go to:
-
-```
-http://localhost/plp-admissions/public/
-```
-
-Log in with the admin account:
-
-| Field    | Value              |
-|----------|--------------------|
-| Email    | admin@plp.edu.ph   |
-| Password | Admin@123          |
-
-> ⚠️ Change the admin password immediately after your first login.
-
----
-
-## Project Structure
-
-```
-plp-admissions/
-├── config/         # App and database configuration
-├── core/           # Router, Auth, Session, helpers
-├── database/       # schema.sql (tables + seed data)
-├── modules/        # Feature modules (auth, exam, interview, documents, results, settings)
-├── public/         # Entry point (index.php), assets, uploads
-└── views/          # Layouts and partials
-```
+1. Log in as a staff/admin user.
+2. **Staff → Interviews → Setup**
+   - You should see the list of colleges.
+   - Click into one — you should land directly on a flat list of sessions
+     for that college (no more Desk → Schedule extra click).
+   - Use **+ Add Session** to create a new one. The form asks for date,
+     start time, end time, capacity, **assigned interviewer**, location
+     label, and notes — all in one shot.
+3. **Staff → Interviews → Live Queue**
+   - Today's queue should still load. The location strip at the top should
+     show the location of today's session for the logged-in interviewer.
+4. **Student → Interview**
+   - The student's booked session card should still show the interviewer
+     name and the location label/notes.
 
 ---
 
-## Roles
+## Notes
 
-| Role    | Description                                              |
-|---------|----------------------------------------------------------|
-| Admin   | Full system access — settings, users, exports, results   |
-| Staff   | Manages documents, exam slots, interviews, and results   |
-| Student | Registers, uploads requirements, takes exam, views results |
-
----
-
-## TODO
-
-### Huenda — Dashboard
-- [ ] Remove all placeholder/AI-generated elements (quick actions, filler widgets)
-- [ ] Redesign dashboard from scratch with focus on clarity and minimalism
-- [ ] Show only the most important metrics (e.g. exam passed/failed counts, applicant pipeline)
-- [ ] Draw a wireframe layout (hand-drawn or digital) before implementation
-- [ ] Include an export button for key reports
-- [ ] Reference modern dashboard designs from Dribbble for inspiration
-
-### Cabilles — Interviews
-- [ ] Add an **"I'm Here"** check-in button for students when their interview time is ready
-- [ ] Auto-assign a queue number upon check-in
-- [ ] Support multiple staff conducting interviews simultaneously, each managing their own queue
-- [ ] Display desk/location instructions so students know where to go
-- [ ] Allow interviewers to record evaluation notes or assessments per student within the system
-
-### Chavez — Applicants
-- [ ] Enhance filter option beside the search bar for sorting/refining results. Change filter status because it is redundant since the tabs already filters it. Instead, use filter by course, type, date applied etc.
-
-### Bassig — Exam Manager
-- [ ] Remove answer mode in each question as sections already describes it
-- [ ] Allow section deleting with confirmation
-- [ ] Show edit section only on empty sections
-
-
----
-
-## Contributing
-
-This is a capstone/academic project.
+- The auto-assignment + auto-reschedule logic in `core/automation.php` and
+  `core/interview_scheduler.php` works against `interview_slots`; it does
+  not use `desk_id`.
+- All `/staff/interviews/...` URLs resolve normally. `/staff/interviews/desks`
+  is kept as an alias of `/staff/interviews/setup` for backward-compat.

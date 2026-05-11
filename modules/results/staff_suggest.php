@@ -5,7 +5,7 @@
 // ============================================================
 
 require_once CORE_PATH . '/bootstrap.php';
-Auth::requireRole(ROLE_STAFF, ROLE_ADMIN);
+Auth::requireRole(ROLE_SSO, ROLE_DEAN, ROLE_ADMIN);
 csrf_check();
 
 $db          = db();
@@ -14,14 +14,14 @@ $course      = trim($_POST['suggest_course'] ?? '');
 $note        = trim($_POST['suggest_note']   ?? '');
 $staffId     = Auth::id();
 
-if (!$applicantId || !in_array($course, PLP_COURSES, true)) {
+if (!$applicantId || !in_array($course, get_all_courses(), true)) {
     Session::flash('error', 'Invalid suggestion data.');
     redirect('/staff/results');
 }
 
 // Verify the applicant exists and failed the exam
 $stmt = $db->prepare(
-    'SELECT a.id, a.course_applied, er.score, er.total_items, er.passed
+    'SELECT a.id, a.course_applied, er.score, er.total_items, er.passed, er.rank_score
      FROM applicants a
      LEFT JOIN exam_results er ON er.applicant_id = a.id
      WHERE a.id = ? LIMIT 1'
@@ -34,9 +34,13 @@ if (!$app) {
     redirect('/staff/results');
 }
 
-// Verify the applicant's rank actually qualifies for the suggested course
-$rank = score_to_rank((int)$app['score'], (int)($app['total_items'] ?: 1));
-$threshold = get_pass_threshold($course);
+// Verify the applicant's rank actually qualifies for the suggested course.
+// Use the rank_score already stored at exam submission time so this gate
+// uses the exact same threshold as exam_passed() — both read COURSE_PASSING_SCORES.
+$rank      = isset($app['rank_score']) && $app['rank_score'] !== null
+    ? (int)$app['rank_score']
+    : score_to_rank((int)$app['score'], (int)($app['total_items'] ?: 1));
+$threshold = COURSE_PASSING_SCORES[$course]['pass_from'] ?? 4;
 if ($rank < $threshold) {
     Session::flash('error', "Applicant's rank ({$rank}) does not meet the passing threshold ({$threshold}) for {$course}.");
     redirect('/staff/results');

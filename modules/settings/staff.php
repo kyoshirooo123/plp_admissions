@@ -5,7 +5,7 @@
 // ============================================================
 
 require_once CORE_PATH . '/bootstrap.php';
-Auth::requireRole(ROLE_STAFF, ROLE_ADMIN);
+Auth::requireRole(ROLE_STAFF, ROLE_SSO, ROLE_DEAN, ROLE_ADMIN);
 
 $db      = db();
 $userId  = Auth::id();
@@ -16,50 +16,6 @@ $success = [];
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     csrf_check();
     $action = $_POST['action'] ?? '';
-
-    // -- School branding -------------------------------------------
-    if ($action === 'update_branding') {
-        $schoolName  = trim($_POST['school_name'] ?? '');
-        $accentColor = trim($_POST['accent_color'] ?? '#2d6a4f');
-
-        if (!$schoolName) { $errors[] = 'School name is required.'; }
-
-        // Logo upload
-        $logoPath = null;
-        if (!empty($_FILES['school_logo']['name'])) {
-            $file    = $_FILES['school_logo'];
-            $finfo   = new finfo(FILEINFO_MIME_TYPE);
-            $mime    = $finfo->file($file['tmp_name']);
-            $allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/svg+xml'];
-            if (!in_array($mime, $allowed, true)) {
-                $errors[] = 'Logo must be JPG, PNG, WEBP, or SVG.';
-            } elseif ($file['size'] > 2 * 1024 * 1024) {
-                $errors[] = 'Logo must be under 2 MB.';
-            } else {
-                $ext      = pathinfo($file['name'], PATHINFO_EXTENSION);
-                $filename = 'school_logo_' . time() . '.' . strtolower($ext);
-                $fileUrl  = uploadcare_upload($file['tmp_name'], $filename, $mime);
-                if ($fileUrl) {
-                    $logoPath = $fileUrl;
-                } else {
-                    $errors[] = 'Logo upload failed.';
-                }
-            }
-        }
-
-        if (empty($errors)) {
-            $upsert = fn($key, $val) => $db->prepare(
-                'INSERT INTO school_settings (setting_key, setting_value) VALUES (?,?)
-                 ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value)'
-            )->execute([$key, $val]);
-
-            $upsert('school_name',  $schoolName);
-            $upsert('accent_color', $accentColor);
-            if ($logoPath) $upsert('school_logo', $logoPath);
-
-            $success[] = 'School branding updated.';
-        }
-    }
 
     // -- Password --------------------------------------------------
     if ($action === 'change_password') {
@@ -85,13 +41,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-}
-
-// Current settings
-$schoolName  = school_setting('school_name', 'Pamantasan ng Lungsod ng Pasig');
-$accentColor = school_setting('accent_color', '#2d6a4f');
-$schoolLogo  = school_setting('school_logo', '');
-
 ob_start();
 ?>
 
@@ -102,7 +51,14 @@ ob_start();
     <div class="alert alert-success" style="margin-bottom:var(--space-3)"><?= e($s) ?></div>
 <?php endforeach; ?>
 
-<div style="display:flex;flex-direction:column;gap:var(--space-6);max-width:560px">
+<div style="display:flex;justify-content:flex-start;margin-bottom:var(--space-4);max-width:560px;margin-left:auto;margin-right:auto">
+    <a href="javascript:history.back()" class="btn btn-ghost btn-sm" style="display:flex;align-items:center;gap:5px">
+        <?= icon('ic_fluent_arrow_left_24_regular', 16) ?>
+        Back
+    </a>
+</div>
+
+<div style="display:flex;flex-direction:column;gap:var(--space-6);max-width:560px;margin:0 auto">
 
     <!-- Appearance: theme toggle -->
     <div class="card" style="padding:var(--space-6)">
@@ -112,57 +68,10 @@ ob_start();
                 <div style="font-size:var(--text-sm);font-weight:var(--weight-medium)">Dark Mode</div>
                 <div style="font-size:var(--text-xs);color:var(--text-tertiary)">Saved to this device</div>
             </div>
-            <button id="theme-toggle-btn" class="btn btn-secondary btn-sm" onclick="toggleThemeFromSettings()">
-                <span id="theme-toggle-label">Toggle</span>
+            <button id="theme-toggle-btn" class="btn btn-secondary btn-sm" onclick="toggleThemeFromSettings()" aria-pressed="false">
+                <span id="theme-toggle-label">Switch to Dark</span>
             </button>
         </div>
-    </div>
-
-    <!-- School branding -->
-    <div class="card" style="padding:var(--space-6)">
-        <div style="font-weight:var(--weight-semibold);margin-bottom:var(--space-5)">School Branding</div>
-        <form method="POST" enctype="multipart/form-data">
-            <?= csrf_field() ?>
-            <input type="hidden" name="action" value="update_branding">
-            <div style="display:flex;flex-direction:column;gap:var(--space-4)">
-
-                <!-- Current logo preview -->
-                <?php if ($schoolLogo): ?>
-                    <div>
-                        <label class="form-label">Current Logo</label>
-                        <img src="<?= str_starts_with($schoolLogo, 'http') ? e($schoolLogo) : e(url('/' . $schoolLogo)) ?>" alt="Logo"
-                             style="height:48px;display:block;border-radius:var(--radius-sm)">
-                    </div>
-                <?php endif; ?>
-
-                <div>
-                    <label class="form-label">School Logo</label>
-                    <input type="file" name="school_logo" class="form-control" accept=".jpg,.jpeg,.png,.webp,.svg">
-                    <p style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:4px">JPG, PNG, WEBP, or SVG · max 2 MB</p>
-                </div>
-
-                <div>
-                    <label class="form-label">School Name</label>
-                    <input type="text" name="school_name" class="form-control" value="<?= e($schoolName) ?>" required>
-                </div>
-
-                <div>
-                    <label class="form-label">Accent Color</label>
-                    <div style="display:flex;align-items:center;gap:var(--space-3)">
-                        <input type="color" name="accent_color" value="<?= e($accentColor) ?>"
-                               style="width:44px;height:36px;padding:2px;border:1px solid var(--border);
-                                      border-radius:var(--radius-md);cursor:pointer;background:none">
-                        <input type="text" id="accent-hex" class="form-control" style="max-width:120px"
-                               value="<?= e($accentColor) ?>" placeholder="#2d6a4f"
-                               oninput="document.querySelector('[name=accent_color]').value=this.value">
-                    </div>
-                </div>
-
-            </div>
-            <div style="margin-top:var(--space-5)">
-                <button type="submit" class="btn btn-primary">Save Branding</button>
-            </div>
-        </form>
     </div>
 
     <!-- Password -->
@@ -213,21 +122,22 @@ ob_start();
 </div>
 
 <script>
-// Sync color picker → hex input
-document.querySelector('[name=accent_color]').addEventListener('input', function() {
-    document.getElementById('accent-hex').value = this.value;
-});
-
 function toggleThemeFromSettings() {
     const html  = document.documentElement;
     const theme = html.dataset.theme === 'dark' ? 'light' : 'dark';
     html.dataset.theme = theme;
     localStorage.setItem('plp_theme', theme);
+    const btn = document.getElementById('theme-toggle-btn');
     document.getElementById('theme-toggle-label').textContent = theme === 'dark' ? 'Switch to Light' : 'Switch to Dark';
+    btn.setAttribute('aria-pressed', theme === 'dark' ? 'true' : 'false');
+    // sync the sidebar pill too
+    const pill = document.querySelector('.theme-pill');
+    if (pill) pill.dataset.theme = theme;
 }
 document.addEventListener('DOMContentLoaded', function() {
     const t = localStorage.getItem('plp_theme') || 'light';
     document.getElementById('theme-toggle-label').textContent = t === 'dark' ? 'Switch to Light' : 'Switch to Dark';
+    document.getElementById('theme-toggle-btn').setAttribute('aria-pressed', t === 'dark' ? 'true' : 'false');
 });
 </script>
 

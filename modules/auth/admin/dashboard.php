@@ -4,10 +4,15 @@
 // ============================================================
 
 require_once CORE_PATH . '/bootstrap.php';
-Auth::requireRole(ROLE_ADMIN);
+Auth::requireRole(ROLE_SSO, ROLE_DEAN, ROLE_ADMIN);
 
 $pdo        = db();
 $schoolYear = school_setting('current_school_year');
+
+// ── Dean dept scope ───────────────────────────────────────────────
+// Dean sees only applicants whose course maps to their own college.
+// Admin / SSO see everything (filter is empty string + empty params).
+[$deptFilter, $deptParams] = viewer_course_filter('a');
 
 // ── Date range ────────────────────────────────────────────────────
 $validRanges = ['today','yesterday','this-week','last-week','this-month','last-month','this-year','last-year','custom'];
@@ -61,10 +66,10 @@ if (isset($_GET['export']) && $_GET['export'] === 'csv') {
         FROM applicants a
         JOIN  users u              ON u.id = a.user_id
         LEFT JOIN admission_results ar ON ar.applicant_id = a.id
-        WHERE a.school_year = ? $dateFilter
+        WHERE a.school_year = ? $dateFilter $deptFilter
         ORDER BY a.created_at DESC
     ");
-    $csvStmt->execute(array_merge([$schoolYear], $dateExtra));
+    $csvStmt->execute(array_merge([$schoolYear], $dateExtra, $deptParams));
     $rows = $csvStmt->fetchAll(PDO::FETCH_ASSOC);
     header('Content-Type: text/csv; charset=utf-8');
     header('Content-Disposition: attachment; filename="plp-admissions-' . $schoolYear . '.csv"');
@@ -85,9 +90,9 @@ $statsStmt = $pdo->prepare("
         SUM(a.overall_status = 'released')    AS released
     FROM applicants a
     LEFT JOIN admission_results ar ON ar.applicant_id = a.id
-    WHERE a.school_year = ? $dateFilter
+    WHERE a.school_year = ? $dateFilter $deptFilter
 ");
-$statsStmt->execute(array_merge([$schoolYear], $dateExtra));
+$statsStmt->execute(array_merge([$schoolYear], $dateExtra, $deptParams));
 $t = $statsStmt->fetch(PDO::FETCH_ASSOC);
 
 $total         = (int)$t['total'];
@@ -104,10 +109,10 @@ $completionPct = $total > 0    ? round($released   / $total    * 100)    : 0;
 $pipelineStmt = $pdo->prepare("
     SELECT overall_status, COUNT(*) AS cnt
     FROM applicants a
-    WHERE a.school_year = ? $dateFilter
+    WHERE a.school_year = ? $dateFilter $deptFilter
     GROUP BY overall_status
 ");
-$pipelineStmt->execute(array_merge([$schoolYear], $dateExtra));
+$pipelineStmt->execute(array_merge([$schoolYear], $dateExtra, $deptParams));
 $pipelineMap    = array_column($pipelineStmt->fetchAll(PDO::FETCH_ASSOC), 'cnt', 'overall_status');
 $pipelineOrder  = ['pending','documents','exam','interview','released'];
 $pipelineLabels = ['Pending','Documents','Exam','Interview','Released'];
@@ -117,12 +122,16 @@ $pipelineData   = array_map(fn($s) => (int)($pipelineMap[$s] ?? 0), $pipelineOrd
 $courseCountsStmt = $pdo->prepare("
     SELECT a.course_applied AS label, COUNT(*) AS cnt
     FROM applicants a
-    WHERE a.school_year = ? $dateFilter
+    WHERE a.school_year = ? $dateFilter $deptFilter
     GROUP BY a.course_applied
 ");
-$courseCountsStmt->execute(array_merge([$schoolYear], $dateExtra));
+$courseCountsStmt->execute(array_merge([$schoolYear], $dateExtra, $deptParams));
 $courseCountsMap = array_column($courseCountsStmt->fetchAll(PDO::FETCH_ASSOC), 'cnt', 'label');
 
+// Show every PLP course on the chart's x-axis regardless of role —
+// Dean still gets dept-scoped counts (zeros for other colleges' courses)
+// from the dept-filtered query above, but the chart context stays
+// complete so they can see the full catalog at a glance.
 $courseLabels = PLP_COURSES;
 $courseData   = array_map(fn($c) => (int)($courseCountsMap[$c] ?? 0), $courseLabels);
 
@@ -130,11 +139,11 @@ $courseData   = array_map(fn($c) => (int)($courseCountsMap[$c] ?? 0), $courseLab
 $strandCountsStmt = $pdo->prepare("
     SELECT a.shs_strand AS label, COUNT(*) AS cnt
     FROM applicants a
-    WHERE a.school_year = ? $dateFilter
+    WHERE a.school_year = ? $dateFilter $deptFilter
       AND a.shs_strand IS NOT NULL AND a.shs_strand != ''
     GROUP BY a.shs_strand
 ");
-$strandCountsStmt->execute(array_merge([$schoolYear], $dateExtra));
+$strandCountsStmt->execute(array_merge([$schoolYear], $dateExtra, $deptParams));
 $strandCountsMap = array_column($strandCountsStmt->fetchAll(PDO::FETCH_ASSOC), 'cnt', 'label');
 
 // Use full labels from config; keys are the DB values
@@ -149,10 +158,10 @@ foreach (SHS_STRANDS as $key => $label) {
 $sexStmt = $pdo->prepare("
     SELECT u.sex, COUNT(*) AS cnt
     FROM applicants a JOIN users u ON u.id = a.user_id
-    WHERE a.school_year = ? $dateFilter AND u.sex IN ('M','F')
+    WHERE a.school_year = ? $dateFilter $deptFilter AND u.sex IN ('M','F')
     GROUP BY u.sex
 ");
-$sexStmt->execute(array_merge([$schoolYear], $dateExtra));
+$sexStmt->execute(array_merge([$schoolYear], $dateExtra, $deptParams));
 $sexMap    = array_column($sexStmt->fetchAll(PDO::FETCH_ASSOC), 'cnt', 'sex');
 $sexMale   = (int)($sexMap['M'] ?? 0);
 $sexFemale = (int)($sexMap['F'] ?? 0);
@@ -204,9 +213,15 @@ ob_start();
     grid-template-rows: auto 1fr;
     gap: var(--space-4);
     align-items: stretch;
-    min-height: calc(100vh - 140px);
+    min-height: 0;
+    flex: 1;
 }
 .db-grid > .card { display: flex; flex-direction: column; }
+
+/* Make the dashboard fill the .page so the bottom gap matches the
+   left/right gap (var(--space-8) = 32px from .page padding). */
+.page:has(.dashboard-wrap) { display:flex; flex-direction:column; }
+.dashboard-wrap { display:flex; flex-direction:column; flex:1; min-height:0; }
 
 /* KPI cards — 4 equal squares, single accent color */
 .db-kpi-grid {
@@ -270,7 +285,7 @@ ob_start();
 /* Date picker */
 .dp-wrap { position:relative; }
 .dp-menu {
-    display:none; position:absolute; right:0; top:calc(100% + var(--space-1));
+    display:none; position:absolute; left:0; top:calc(100% + var(--space-1));
     min-width:176px; background:var(--bg-elevated); border:1px solid var(--border);
     border-radius:var(--radius-md); box-shadow:var(--shadow-md);
     padding:var(--space-1) 0; z-index:200;
@@ -300,19 +315,22 @@ ob_start();
 }
 </style>
 
-<div>
+<div class="dashboard-wrap">
 
     <!-- ── Header ───────────────────────────────────────────────── -->
     <div class="db-header">
-        <div>
-            <h1 class="db-heading">Admissions dashboard</h1>
-            <p class="db-sub">Pamantasan ng Lungsod ng Pasig &middot; SY <?= e($schoolYear) ?></p>
-        </div>
         <div class="db-controls">
 
             <div class="dp-wrap" id="dpWrap">
-                <button class="btn btn-secondary btn-sm" onclick="dpToggle(event)" type="button">
-                    <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+                <button class="db-pill-btn" onclick="dpToggle(event)" type="button" style="
+                    display:flex;align-items:center;gap:var(--space-2);
+                    height:32px;padding:0 var(--space-3);
+                    border:1px solid var(--border);border-radius:var(--radius-sm);
+                    background:var(--bg-elevated);color:var(--text-secondary);
+                    font-size:var(--text-sm);cursor:pointer;white-space:nowrap;
+                    transition:border-color var(--transition-fast),color var(--transition-fast);
+                ">
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
                         <rect x="1" y="2.5" width="14" height="12" rx="2" stroke="currentColor" stroke-width="1.3"/>
                         <path d="M5 1v3M11 1v3M1 7h14" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
                     </svg>
@@ -343,8 +361,15 @@ ob_start();
                 </div>
             </div>
 
-            <a class="btn btn-secondary btn-sm" href="<?= $exportUrl ?>">
-                <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+            <a class="db-pill-btn" href="<?= $exportUrl ?>" style="
+                display:flex;align-items:center;gap:var(--space-2);
+                height:32px;padding:0 var(--space-3);
+                border:1px solid var(--border);border-radius:var(--radius-sm);
+                background:var(--bg-elevated);color:var(--text-secondary);
+                font-size:var(--text-sm);cursor:pointer;white-space:nowrap;text-decoration:none;
+                transition:border-color var(--transition-fast),color var(--transition-fast);
+            ">
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
                     <path d="M3 12.5h10M8 1.5v8M5 6.5l3 3 3-3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
                 Export CSV
@@ -450,7 +475,7 @@ ob_start();
 
 </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="<?= asset('js/chart.umd.js') ?>"></script>
 <script>
 (function () {
 
@@ -480,7 +505,8 @@ ob_start();
         Chart.defaults.color = textSecond;
 
         var xGrid = { grid:{color:border}, border:{display:false}, ticks:{color:textSecond, precision:0} };
-        var yFlat = { grid:{display:false}, border:{display:false}, ticks:{color:textPrimary, font:{size:12}} };
+        var yFlat  = { grid:{display:false}, border:{display:false}, ticks:{color:textPrimary, font:{size:12}} };
+    var yWide  = { grid:{display:false}, border:{display:false}, ticks:{color:textPrimary, font:{size:12}}, afterFit:function(axis){ axis.width = axis.chart.width * 0.58; } };
         var tip   = { callbacks:{ label:function(c){ return ' '+c.raw+' applicants'; } } };
 
         // Pipeline — horizontal bar (same accent, different opacity per stage)
@@ -500,10 +526,10 @@ ob_start();
         charts.course = new Chart(document.getElementById('chartCourse'), {
             type: 'bar',
             data: { labels:DATA.course.labels,
-                datasets:[{ data:DATA.course.data, backgroundColor:barColor, borderRadius:5, borderSkipped:false }] },
+                datasets:[{ data:DATA.course.data, backgroundColor:barColor, borderRadius:4, borderSkipped:false, barThickness:10, maxBarThickness:12 }] },
             options: { indexAxis:'y', responsive:true, maintainAspectRatio:false,
                 plugins:{ legend:{display:false}, tooltip:tip },
-                scales:{ x:xGrid, y:yFlat } }
+                scales:{ x:xGrid, y:yWide } }
         });
 
         // SHS Strand — same single color
@@ -515,16 +541,11 @@ ob_start();
                 plugins:{ legend:{display:false}, tooltip:{ callbacks:{ label:function(c){
                     return ' '+c.raw+' applicants';
                 }}}},
-                scales:{ x:xGrid, y:yFlat } }
+                scales:{ x:xGrid, y:yWide } }
         });
         var sl=document.getElementById('strandLegend');
         if(sl) sl.innerHTML='';
 
-        // Sex — donut
-        var fc=success, mc=info;
-        var df=document.getElementById('dotFemale'), dm=document.getElementById('dotMale');
-        if(df) df.style.background=fc;
-        if(dm) dm.style.background=mc;
     }
 
     buildCharts();

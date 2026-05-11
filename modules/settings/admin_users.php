@@ -23,9 +23,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $email = strtolower(trim($_POST['email'] ?? ''));
             $role  = $_POST['role'] ?? '';
             $pass  = $_POST['password'] ?? '';
+            $dept  = trim($_POST['department'] ?? '');
 
-            if (!$name || !$email || !in_array($role, ['staff', 'admin'], true) || strlen($pass) < 8) {
+            $allowedRoles = [ROLE_STAFF, ROLE_SSO, ROLE_DEAN, ROLE_ADMIN];
+            if (!$name || !$email || !in_array($role, $allowedRoles, true) || strlen($pass) < 8) {
                 $errors[] = 'All fields are required. Password must be at least 8 characters.';
+                break;
+            }
+
+            if ($dept !== '' && !in_array($dept, departments_list(), true)) {
+                $errors[] = 'Invalid department selected.';
+                break;
+            }
+
+            // Dean accounts must be scoped to a department.
+            if ($role === ROLE_DEAN && $dept === '') {
+                $errors[] = 'Dean accounts must be assigned to a department.';
                 break;
             }
 
@@ -34,10 +47,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($check->fetch()) { $errors[] = 'Email already exists.'; break; }
 
             $hash = password_hash($pass, PASSWORD_BCRYPT, ['cost' => 12]);
-            $db->prepare('INSERT INTO users (name, email, password_hash, role) VALUES (?,?,?,?)')
-               ->execute([$name, $email, $hash, $role]);
-            audit_log('user_created', "Created {$role} account for {$name} ({$email})", 'user', (int)$db->lastInsertId());
+            $db->prepare('INSERT INTO users (name, email, password_hash, role, department) VALUES (?,?,?,?,?)')
+               ->execute([$name, $email, $hash, $role, $dept]);
+            $newId = (int)$db->lastInsertId();
+            audit_log(
+                'user_created',
+                "Created {$role} account for {$name} ({$email})"
+                    . ($dept !== '' ? " in {$dept}" : ''),
+                'user',
+                $newId
+            );
             $success[] = "$name ($role) account created.";
+            break;
+
+        case 'update_department':
+            $uid  = (int)($_POST['user_id'] ?? 0);
+            $dept = trim($_POST['department'] ?? '');
+            if ($uid <= 0) {
+                $errors[] = 'Invalid user.';
+                break;
+            }
+            if ($dept !== '' && !in_array($dept, departments_list(), true)) {
+                $errors[] = 'Invalid department selected.';
+                break;
+            }
+            set_user_department($uid, $dept, $adminId);
+            $success[] = 'Department updated.';
             break;
 
         case 'toggle_active':
@@ -70,20 +105,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
-// Load staff + admin users
-$stmt = $db->prepare(
-    'SELECT * FROM users WHERE role IN ("staff","admin") ORDER BY role, name'
-);
-$stmt->execute();
+// Filter: department
+$filterDept = trim($_GET['department'] ?? '');
+$availableDepts = departments_list();
+if ($filterDept !== '' && !in_array($filterDept, $availableDepts, true)) {
+    $filterDept = '';
+}
+
+$sql     = 'SELECT * FROM users WHERE role IN ("staff","sso","dean","admin")';
+$params  = [];
+if ($filterDept !== '') {
+    $sql    .= ' AND department = ?';
+    $params[] = $filterDept;
+}
+$sql    .= ' ORDER BY role, name';
+
+$stmt = $db->prepare($sql);
+$stmt->execute($params);
 $staffUsers = $stmt->fetchAll();
 
 ob_start();
 ?>
 
-<div style="display:flex;justify-content:flex-end;margin-bottom:var(--space-6)">
-    <button class="btn btn-primary" onclick="document.getElementById('create-user-modal').style.display='flex'">
-        + New User
-    </button>
+<?php foreach ($errors as $err): ?>
+    <div class="alert alert-error" style="margin-bottom:var(--space-3)"><?= e($err) ?></div>
+<?php endforeach; ?>
+<?php foreach ($success as $suc): ?>
+    <div class="alert alert-success" style="margin-bottom:var(--space-3)"><?= e($suc) ?></div>
+<?php endforeach; ?>
+
+<div style="margin-bottom:var(--space-6)">
+    <form method="GET" style="display:flex;align-items:center;gap:var(--space-2)">
+        <label for="dept-filter" style="font-size:var(--text-sm);color:var(--text-secondary)">Department:</label>
+        <select id="dept-filter" name="department" class="form-control"
+                style="width:auto;min-width:240px" onchange="this.form.submit()">
+            <option value="">All departments</option>
+            <?php foreach ($availableDepts as $deptName): ?>
+                <option value="<?= e($deptName) ?>" <?= $filterDept === $deptName ? 'selected' : '' ?>>
+                    <?= e($deptName) ?>
+                </option>
+            <?php endforeach; ?>
+        </select>
+        <?php if ($filterDept !== ''): ?>
+            <a href="<?= url('/admin/users') ?>" class="btn btn-ghost btn-sm">Clear</a>
+        <?php endif; ?>
+    </form>
 </div>
 
 <?php foreach ($errors as $e): ?>
@@ -93,13 +159,14 @@ ob_start();
     <div class="alert alert-success" style="margin-bottom:var(--space-3)"><?= e($s) ?></div>
 <?php endforeach; ?>
 
-<div class="card" style="padding:0;overflow:hidden">
-    <table class="table">
+<div class="card" style="padding:0;overflow:hidden;width:100%">
+    <table class="table" style="width:100%">
         <thead>
             <tr>
                 <th>Name</th>
                 <th>Email</th>
                 <th>Role</th>
+                <th>Department</th>
                 <th>Status</th>
                 <th>Created</th>
                 <th style="width:140px"></th>
@@ -107,13 +174,41 @@ ob_start();
         </thead>
         <tbody>
         <?php if (empty($staffUsers)): ?>
-            <tr><td colspan="6" style="text-align:center;padding:var(--space-8);color:var(--text-tertiary)">No staff or admin accounts.</td></tr>
+            <tr><td colspan="7" style="text-align:center;padding:var(--space-8);color:var(--text-tertiary)">No staff or admin accounts.</td></tr>
         <?php else: ?>
             <?php foreach ($staffUsers as $u): ?>
                 <tr>
                     <td style="font-weight:var(--weight-medium)"><?= e($u['name']) ?></td>
                     <td style="font-size:var(--text-sm);color:var(--text-tertiary)"><?= e($u['email']) ?></td>
-                    <td><span class="badge badge-<?= $u['role'] === 'admin' ? 'error' : 'info' ?>"><?= ucfirst($u['role']) ?></span></td>
+                    <td>
+                        <?php
+                            $roleBadge = match ($u['role']) {
+                                ROLE_ADMIN => 'error',
+                                ROLE_DEAN  => 'warning',
+                                ROLE_SSO   => 'success',
+                                ROLE_STAFF => 'info',
+                                default    => 'neutral',
+                            };
+                        ?>
+                        <span class="badge badge-<?= e($roleBadge) ?>"><?= e(Auth::roleLabel($u['role'])) ?></span>
+                    </td>
+                    <td style="font-size:var(--text-sm)">
+                        <form method="POST" style="display:inline-flex;align-items:center;gap:var(--space-1)">
+                            <?= csrf_field() ?>
+                            <input type="hidden" name="action" value="update_department">
+                            <input type="hidden" name="user_id" value="<?= $u['id'] ?>">
+                            <select name="department" class="form-control" style="font-size:var(--text-xs);padding:var(--space-1) var(--space-2);min-width:200px"
+                                    onchange="this.form.submit()">
+                                <option value="">— none —</option>
+                                <?php foreach ($availableDepts as $deptName): ?>
+                                    <option value="<?= e($deptName) ?>"
+                                            <?= ($u['department'] ?? '') === $deptName ? 'selected' : '' ?>>
+                                        <?= e($deptName) ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </form>
+                    </td>
                     <td>
                         <?php if ($u['is_active']): ?>
                             <span class="badge badge-success">Active</span>
@@ -148,6 +243,14 @@ ob_start();
     </table>
 </div>
 
+<!-- New User button below table -->
+<div style="margin-top:var(--space-4);display:flex;justify-content:center">
+    <button class="btn btn-primary" onclick="document.getElementById('create-user-modal').style.display='flex'">
+        <?= icon('ic_fluent_add_24_regular', 15) ?>
+        New User
+    </button>
+</div>
+
 <!-- Create user modal -->
 <div id="create-user-modal" class="modal-backdrop" style="display:none">
     <div class="modal" style="max-width:420px">
@@ -171,10 +274,24 @@ ob_start();
                 </div>
                 <div>
                     <label class="form-label">Role <span style="color:var(--error)">*</span></label>
-                    <select name="role" class="form-control" required>
+                    <select name="role" id="role-select" class="form-control" required>
                         <option value="">Select role…</option>
-                        <option value="staff">Staff</option>
-                        <option value="admin">Admin</option>
+                        <option value="<?= ROLE_STAFF ?>">Professor (proctor exams &amp; conduct interviews)</option>
+                        <option value="<?= ROLE_SSO ?>">SSO (documents, scheduling, exam content, results release)</option>
+                        <option value="<?= ROLE_DEAN ?>">Dean (per-college oversight, courses &amp; tier thresholds)</option>
+                        <option value="<?= ROLE_ADMIN ?>">Admin (full access)</option>
+                    </select>
+                </div>
+                <div>
+                    <label class="form-label" id="dept-label">
+                        Department
+                        <span id="dept-hint" style="color:var(--text-tertiary);font-weight:400"> — optional for SSO and Admin</span>
+                    </label>
+                    <select name="department" id="dept-select" class="form-control">
+                        <option value="">— none —</option>
+                        <?php foreach ($availableDepts as $deptName): ?>
+                            <option value="<?= e($deptName) ?>"><?= e($deptName) ?></option>
+                        <?php endforeach; ?>
                     </select>
                 </div>
                 <div>
@@ -226,10 +343,30 @@ function openResetModal(uid, name) {
 [document.getElementById('create-user-modal'), document.getElementById('reset-pw-modal')].forEach(m => {
     m.addEventListener('click', function(e){ if(e.target===this) this.style.display='none'; });
 });
+
+// Make department required when role is Dean, optional otherwise.
+(function(){
+    var roleSel = document.getElementById('role-select');
+    var deptSel = document.getElementById('dept-select');
+    var deptHint = document.getElementById('dept-hint');
+    if (!roleSel || !deptSel) return;
+    function sync() {
+        var isDean = roleSel.value === '<?= ROLE_DEAN ?>';
+        deptSel.required = isDean;
+        if (deptHint) {
+            deptHint.textContent = isDean
+                ? ' — required for Dean'
+                : ' — optional for SSO and Admin';
+        }
+    }
+    roleSel.addEventListener('change', sync);
+    sync();
+})();
 </script>
 
 <?php
 $content   = ob_get_clean();
 $pageTitle = 'User Management';
 $activeNav = 'users';
+$pageWide  = true;
 include VIEWS_PATH . '/layouts/app.php';
