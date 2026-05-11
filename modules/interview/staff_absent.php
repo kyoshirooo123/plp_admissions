@@ -294,8 +294,8 @@ $rescheduleRequests = $db->query(
             u.first_name, u.middle_name, u.last_name, u.suffix,
             u.email             AS student_email,
             u.department        AS student_department,
-            s.slot_date         AS current_date,
-            s.slot_time         AS current_time,
+            s.slot_date         AS current_slot_date,
+            s.slot_time         AS current_slot_time,
             s.department        AS current_department
        FROM reschedule_requests rr
        JOIN applicants a       ON a.id = rr.applicant_id
@@ -383,11 +383,11 @@ ob_start();
                             </div>
                         </td>
                         <td style="padding:var(--space-3) var(--space-4)">
-                            <?php if ($req['current_date']): ?>
-                                <?= format_date($req['current_date']) ?>
-                                <?php if ($req['current_time']): ?>
+                            <?php if ($req['current_slot_date']): ?>
+                                <?= format_date($req['current_slot_date']) ?>
+                                <?php if ($req['current_slot_time']): ?>
                                     <div style="color:var(--text-tertiary);font-size:var(--text-xs)">
-                                        <?= format_time($req['current_time']) ?>
+                                        <?= format_time($req['current_slot_time']) ?>
                                     </div>
                                 <?php endif; ?>
                             <?php else: ?>
