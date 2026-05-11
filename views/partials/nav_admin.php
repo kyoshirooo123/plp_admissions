@@ -116,6 +116,26 @@ try {
     }
 } catch (\Throwable $e) { /* tables missing — silent */ }
 
+// Pending reschedule requests — surface a sidebar entry for SSO / Admin
+// when there is anything to review, otherwise the page is unreachable
+// (sidebar "Interviews" lands SSO on /staff/interviews/setup which has
+// no link to /staff/interviews/absent).
+$_navReschedPending = 0;
+$_navAbsentPending  = 0;
+if ($navRole === ROLE_ADMIN || $navRole === ROLE_SSO) {
+    try {
+        $_navReschedPending = (int)$_navDb->query(
+            "SELECT COUNT(*) FROM reschedule_requests WHERE status='pending'"
+        )->fetchColumn();
+    } catch (\Throwable $e) { /* table missing — silent */ }
+    try {
+        $_navAbsentPending = (int)$_navDb->query(
+            "SELECT COUNT(*) FROM interview_queue WHERE interview_status='absent'"
+        )->fetchColumn();
+    } catch (\Throwable $e) { /* table missing — silent */ }
+}
+$_navAbsentHasWork = ($_navReschedPending + $_navAbsentPending) > 0;
+
 // Dean's "Interviews" link goes to the queue page (read-only), since
 // /staff/interviews shows a setup-card landing that's geared toward
 // Admin. SSO doesn't run interviews — they only set sessions up — so
@@ -140,6 +160,9 @@ $items = [
         'roles' => [ROLE_ADMIN, ROLE_SSO]],
     ['href' => $intHref,             'key' => 'interviews',  'label' => 'Interviews',       'icon' => 'ic_fluent_calendar_ltr_24_regular',  'alert' => !$_navIntReady,
         'roles' => [ROLE_ADMIN, ROLE_SSO, ROLE_DEAN]],
+    ['href' => '/staff/interviews/absent' . ($_navReschedPending > 0 ? '?tab=requests' : ''),
+        'key' => 'reschedules', 'label' => 'Reschedules',  'icon' => 'ic_fluent_arrow_sync_24_regular',  'pending' => $_navAbsentHasWork,
+        'roles' => [ROLE_ADMIN, ROLE_SSO]],
     ['href' => '/staff/results',     'key' => 'results',     'label' => 'Results',          'icon' => 'ic_fluent_ribbon_star_24_regular',   'pending' => $_navResPending,
         'roles' => [ROLE_ADMIN, ROLE_SSO, ROLE_DEAN]],
 
