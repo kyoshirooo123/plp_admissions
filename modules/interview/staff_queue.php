@@ -63,6 +63,48 @@ if ($canSeeAll && $collegeFilter === '') {
 }
 
 // ----------------------------------------------------------------
+// Date filter
+//
+// The queue used to show every slot_date in one list, which made it
+// impossible for a Professor running today's session to focus only on
+// the people actually walking in today (rows for next week and the
+// previous week's no-shows all rendered together). The default scope
+// is now today; the dropdown lets staff explicitly widen the view.
+//
+// Allowed values:
+//   today      — slot_date = CURDATE() (default)
+//   tomorrow   — slot_date = CURDATE() + 1
+//   upcoming   — slot_date >= CURDATE()
+//   past       — slot_date < CURDATE() (mostly no-show rows)
+//   all        — no date filter
+// ----------------------------------------------------------------
+$allowedDateFilters = ['today', 'tomorrow', 'upcoming', 'past', 'all'];
+$dateFilter = (string)($_GET['date'] ?? 'today');
+if (!in_array($dateFilter, $allowedDateFilters, true)) {
+    $dateFilter = 'today';
+}
+$dateWhereSql    = '';
+$dateWhereParams = [];
+switch ($dateFilter) {
+    case 'today':
+        $dateWhereSql    = ' AND s.slot_date = CURDATE()';
+        break;
+    case 'tomorrow':
+        $dateWhereSql    = ' AND s.slot_date = DATE_ADD(CURDATE(), INTERVAL 1 DAY)';
+        break;
+    case 'upcoming':
+        $dateWhereSql    = ' AND s.slot_date >= CURDATE()';
+        break;
+    case 'past':
+        $dateWhereSql    = ' AND s.slot_date < CURDATE()';
+        break;
+    case 'all':
+    default:
+        $dateWhereSql    = '';
+        break;
+}
+
+// ----------------------------------------------------------------
 // Desk strip — find this interviewer's most-recent (or upcoming)
 // physical location so the staff sees where to send walk-ins. Purely
 // informational; it does NOT scope the table below. Only Professors
@@ -114,21 +156,32 @@ catch (\Throwable $e) {
 // ----------------------------------------------------------------
 // AUTO NO-SHOW
 // Flip any still-waiting / in-progress queue row whose slot has
-// already finished into status='no_show'. This runs on every page
-// load so the table always reflects reality without anyone having
-// to click a button.
+// already finished into status='no_show' AND interview_status='absent'.
+// This runs on every page load so the table always reflects reality
+// without anyone having to click a button.
 //
 // "Finished" means:
 //   • slot_date is before today, OR
 //   • slot_date is today AND end_time is set AND end_time <= NOW, OR
 //   • slot_date is today AND end_time is NULL AND slot_time is set
 //     AND the start time was more than an hour ago.
+//
+// Updating BOTH status and interview_status is intentional: the
+// pending-queue filter used by bulk_assign_pending_applicants()
+// excludes rows where interview_status IN ('pending','completed'),
+// so leaving interview_status at 'pending' would keep the no-show
+// applicant permanently locked out of auto-rebooking. Flipping to
+// 'absent' both surfaces them on /staff/interviews/absent and lets
+// the scheduler pick them up on the next slot creation.
 // ----------------------------------------------------------------
 try {
     $autoNoShow = $db->prepare(
         'UPDATE interview_queue q
          JOIN   interview_slots s ON s.id = q.slot_id
-         SET    q.status = "no_show"
+         SET    q.status           = "no_show",
+                q.interview_status = "absent",
+                q.attendance_status = "absent",
+                q.evaluated_at      = COALESCE(q.evaluated_at, NOW())
          WHERE  q.status IN ("scheduled", "checked_in", "in_progress")
            AND (
                  s.slot_date < CURDATE()
@@ -190,14 +243,18 @@ if ($canSeeAll && !$showAll) {
     // Admin / SSO with a specific college picked - scope by slot department.
     $stmt = $db->prepare(
         $selectCols .
-        ' WHERE s.department = ?' .
+        ' WHERE s.department = ?' . $dateWhereSql .
         $orderTail
     );
-    $stmt->execute([$collegeFilter]);
+    $stmt->execute(array_merge([$collegeFilter], $dateWhereParams));
 } elseif ($canSeeAll) {
     // Admin / SSO with the explicit "all" escape hatch - every row, every college.
-    $stmt = $db->prepare($selectCols . $orderTail);
-    $stmt->execute();
+    $stmt = $db->prepare(
+        $selectCols .
+        ($dateWhereSql !== '' ? ' WHERE 1 ' . $dateWhereSql : '') .
+        $orderTail
+    );
+    $stmt->execute($dateWhereParams);
 } elseif ($isDean) {
     // Dean — every row whose slot is in their college (oversight).
     // Fall back to the COALESCE(assigned_to, created_by) ownership rule
@@ -206,26 +263,26 @@ if ($canSeeAll && !$showAll) {
     if ($staffDept !== '') {
         $stmt = $db->prepare(
             $selectCols .
-            ' WHERE s.department = ?' .
+            ' WHERE s.department = ?' . $dateWhereSql .
             $orderTail
         );
-        $stmt->execute([$staffDept]);
+        $stmt->execute(array_merge([$staffDept], $dateWhereParams));
     } else {
         $stmt = $db->prepare(
             $selectCols .
-            ' WHERE COALESCE(s.assigned_to, s.created_by) = ?' .
+            ' WHERE COALESCE(s.assigned_to, s.created_by) = ?' . $dateWhereSql .
             $orderTail
         );
-        $stmt->execute([$staffId]);
+        $stmt->execute(array_merge([$staffId], $dateWhereParams));
     }
 } else {
     // Professor — only rows on a session they personally own.
     $stmt = $db->prepare(
         $selectCols .
-        ' WHERE COALESCE(s.assigned_to, s.created_by) = ?' .
+        ' WHERE COALESCE(s.assigned_to, s.created_by) = ?' . $dateWhereSql .
         $orderTail
     );
-    $stmt->execute([$staffId]);
+    $stmt->execute(array_merge([$staffId], $dateWhereParams));
 }
 $rows = $stmt->fetchAll();
 
@@ -406,14 +463,44 @@ ob_start();
 <?php else: ?>
 
 <!-- ============================================================
-     TOOLBAR — search + count
+     TOOLBAR — search + date filter + count
 ============================================================ -->
+<?php
+// Preserve other GET params (college, etc.) when changing the date
+// filter so we don't bounce the user back to the college picker.
+$dateFilterBaseQuery = $_GET;
+unset($dateFilterBaseQuery['date']);
+$dateFilterBaseHref = url('/staff/interviews/queue') .
+    (!empty($dateFilterBaseQuery) ? '?' . http_build_query($dateFilterBaseQuery) : '');
+$dateFilterSep = (strpos($dateFilterBaseHref, '?') !== false) ? '&' : '?';
+?>
 <div class="iq-toolbar">
     <div class="iq-search-wrap">
         <?= icon('ic_fluent_search_24_filled', 14, 'position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text-tertiary);pointer-events:none') ?>
         <input type="search" id="iq-filter" placeholder="Filter by name or course…"
                autocomplete="off">
     </div>
+    <select id="iq-date-filter"
+            style="height:36px;padding:0 var(--space-3);font-size:var(--text-sm);
+                   border:1px solid var(--border);border-radius:var(--radius-sm);
+                   background:var(--bg-elevated);color:var(--text-primary)"
+            onchange="window.location.href = this.value">
+        <?php
+        $dateOptions = [
+            'today'    => 'Today',
+            'tomorrow' => 'Tomorrow',
+            'upcoming' => 'All upcoming',
+            'past'     => 'Past dates',
+            'all'      => 'All dates',
+        ];
+        foreach ($dateOptions as $val => $label):
+            $href = $dateFilterBaseHref . $dateFilterSep . 'date=' . $val;
+        ?>
+            <option value="<?= e($href) ?>" <?= $dateFilter === $val ? 'selected' : '' ?>>
+                <?= e($label) ?>
+            </option>
+        <?php endforeach; ?>
+    </select>
     <span class="iq-count">
         <?= count($rows) ?> applicant<?= count($rows) === 1 ? '' : 's' ?>
     </span>
@@ -447,6 +534,14 @@ ob_start();
             $isFinal   = in_array($r['status'], ['completed', 'no_show'], true);
             $existing  = $r['interview_notes'] ?? '';
             $haystack  = strtolower($name . ' ' . $course . ' ' . $type);
+            // Evaluation gating:
+            //   • Dean = oversight only (read-only, mirrors Results page).
+            //   • SSO  = setup-only (already bounced above, defensive here).
+            //   • Row's slot_date must be today — past/future rows cannot be
+            //     evaluated since the interview hasn't actually happened yet
+            //     (or the slot has already auto-flipped to no-show).
+            $isTodayRow = isset($r['slot_date']) && (string)$r['slot_date'] === $today;
+            $canEval    = !$isDean && !$isSSO && $isTodayRow;
         ?>
             <tr class="<?= $rowClass ?>" data-name="<?= e($haystack) ?>">
                 <td>
@@ -513,6 +608,19 @@ ob_start();
                                     <?= $r['evaluation_result']
                                         ? e(ucfirst($r['evaluation_result']))
                                         : 'Completed' ?>
+                                <?php endif; ?>
+                            </span>
+                        <?php elseif (!$canEval): ?>
+                            <span style="font-size:var(--text-xs);color:var(--text-tertiary)"
+                                  title="<?= $isDean
+                                            ? 'Dean is read-only — only Professors / Admin can evaluate'
+                                            : (!$isTodayRow ? 'Evaluation is only available on the interview\'s scheduled date' : '') ?>">
+                                <?php if ($isDean): ?>
+                                    Read only
+                                <?php elseif (!$isTodayRow): ?>
+                                    <?= e(format_date($r['slot_date'])) ?>
+                                <?php else: ?>
+                                    —
                                 <?php endif; ?>
                             </span>
                         <?php else: ?>

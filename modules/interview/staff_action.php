@@ -55,6 +55,14 @@ switch ($action) {
     // Queue: complete with inline evaluation (Pass/Fail + notes)
     // ----------------------------------------------------------------
     case 'complete_with_evaluation':
+        // Dean is oversight-only; SSO is setup-only. Neither role
+        // conducts interviews, so block the action even if the UI
+        // somehow exposed the button.
+        if (Auth::role() === ROLE_DEAN || Auth::role() === ROLE_SSO) {
+            Session::flash('error', 'Only Professors / Admin can record an evaluation.');
+            redirect('/staff/interviews/queue');
+        }
+
         $evalResult = strtolower(trim($_POST['evaluation_result'] ?? ''));
         $evalNotes  = trim($_POST['interview_notes'] ?? '');
 
@@ -63,12 +71,25 @@ switch ($action) {
             redirect('/staff/interviews/queue');
         }
 
-        $stmt = $db->prepare('SELECT q.applicant_id FROM interview_queue q WHERE q.id = ?');
+        $stmt = $db->prepare(
+            'SELECT q.applicant_id, s.slot_date
+               FROM interview_queue q
+          LEFT JOIN interview_slots s ON s.id = q.slot_id
+              WHERE q.id = ?'
+        );
         $stmt->execute([$id]);
         $row = $stmt->fetch();
 
         if (!$row) {
             Session::flash('error', 'Interview queue entry not found.');
+            redirect('/staff/interviews/queue');
+        }
+
+        // Slot-date gate: an interview can only be evaluated on its
+        // scheduled date. Past dates have auto-flipped to no-show;
+        // future dates haven't happened yet.
+        if (!empty($row['slot_date']) && (string)$row['slot_date'] !== date('Y-m-d')) {
+            Session::flash('error', 'Evaluation is only available on the interview\'s scheduled date.');
             redirect('/staff/interviews/queue');
         }
 
