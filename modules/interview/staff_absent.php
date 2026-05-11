@@ -556,5 +556,5 @@ ob_start();
 <?php
 $content   = ob_get_clean();
 $pageTitle = 'Absent Students';
-$activeNav = 'interviews';
+$activeNav = 'reschedules';
 include VIEWS_PATH . '/layouts/app.php';

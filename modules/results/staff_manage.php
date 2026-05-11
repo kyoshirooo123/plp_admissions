@@ -362,6 +362,28 @@ $awaitingCount = (int)$countRows['awaiting_count'];
    card matches the .page horizontal padding (var(--space-8) = 32px). */
 .page:has(.results-table-card) { display:flex; flex-direction:column; }
 .results-table-card { flex:1; min-height:300px; }
+
+/* Uniform row sizing for the Results table so the Actions column
+   buttons (Release / Edit) line up cleanly across every row. Without
+   this, rows with extra context (badges, interview notes, admission
+   remarks) grow taller than rows without and the buttons appear to
+   "jump" or vanish at unexpected y-positions — the inconsistency the
+   user flagged in the screenshot. `height` on a <tr> is treated as a
+   min-height by browsers, so long content still gets to breathe. */
+#results-table tbody tr  { height: 72px; }
+#results-table tbody td  {
+    vertical-align: middle;
+    padding-top:    var(--space-3);
+    padding-bottom: var(--space-3);
+}
+#results-table tbody td:last-child { white-space: nowrap; }
+#results-table .res-action-cell {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    min-height: 36px;
+    gap: var(--space-2);
+}
 </style>
 
 <!-- ── Results table ──────────────────────────────────────── -->
@@ -496,6 +518,7 @@ $awaitingCount = (int)$countRows['awaiting_count'];
 
                     <!-- Actions -->
                     <td>
+                        <div class="res-action-cell">
                         <?php if ($bucket === 'withdrawn'): ?>
                             <span style="font-size:var(--text-xs);color:var(--text-tertiary)">Withdrawn</span>
 
@@ -512,15 +535,15 @@ $awaitingCount = (int)$countRows['awaiting_count'];
                             <?php endif; ?>
 
                         <?php elseif (($bucket === 'ready_accept' || $bucket === 'ready_reject') && $canRelease): ?>
-                            <form method="POST" action="<?= url('/staff/results/' . $row['id']) ?>" style="margin:0">
+                            <form method="POST" action="<?= url('/staff/results/' . $row['id']) ?>" style="margin:0;display:inline-flex;align-items:center">
                                 <?= csrf_field() ?>
                                 <input type="hidden" name="action" value="release">
                                 <?php
                                     $isAccept = ($bucket === 'ready_accept');
                                     $btnLabel = $isAccept ? 'Release as Accept' : 'Release as Reject';
                                     $btnStyle = $isAccept
-                                        ? 'background:var(--success);color:#fff;border-color:var(--success);font-size:var(--text-xs)'
-                                        : 'background:var(--error);color:#fff;border-color:var(--error);font-size:var(--text-xs)';
+                                        ? 'background:var(--success);color:#fff;border-color:var(--success);font-size:var(--text-xs);white-space:nowrap'
+                                        : 'background:var(--error);color:#fff;border-color:var(--error);font-size:var(--text-xs);white-space:nowrap';
                                     $confirm  = $isAccept
                                         ? "Release {$fullName} as Accepted? The applicant will be notified by email."
                                         : "Release {$fullName} as Rejected? The applicant will be notified by email.";
@@ -543,6 +566,7 @@ $awaitingCount = (int)$countRows['awaiting_count'];
                         <?php else: /* awaiting */ ?>
                             <span style="font-size:var(--text-xs);color:var(--text-tertiary)">Awaiting interview</span>
                         <?php endif; ?>
+                        </div>
                     </td>
                 </tr>
             <?php endforeach; ?>

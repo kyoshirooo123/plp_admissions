@@ -63,45 +63,82 @@ if ($canSeeAll && $collegeFilter === '') {
 }
 
 // ----------------------------------------------------------------
-// Date filter
+// Date filter — slot-derived
 //
 // The queue used to show every slot_date in one list, which made it
 // impossible for a Professor running today's session to focus only on
-// the people actually walking in today (rows for next week and the
-// previous week's no-shows all rendered together). The default scope
-// is now today; the dropdown lets staff explicitly widen the view.
+// the people actually walking in today. The dropdown is now built
+// from the distinct slot_dates that ACTUALLY have queue rows in the
+// caller's scope, so there are no dead options ("Past dates (0)")
+// and no surprises ("Today" empty when the session is tomorrow).
 //
-// Allowed values:
-//   today      — slot_date = CURDATE() (default)
-//   tomorrow   — slot_date = CURDATE() + 1
-//   upcoming   — slot_date >= CURDATE()
-//   past       — slot_date < CURDATE() (mostly no-show rows)
+// `?date=` accepts either:
+//   YYYY-MM-DD — exact slot date (must be one of the dates the scope
+//                actually has rows for; otherwise we fall back to
+//                today if today is in the list, else "all")
 //   all        — no date filter
+//
+// Default: today if today is in the list, else the soonest upcoming
+// date in the list, else "all".
 // ----------------------------------------------------------------
-$allowedDateFilters = ['today', 'tomorrow', 'upcoming', 'past', 'all'];
-$dateFilter = (string)($_GET['date'] ?? 'today');
-if (!in_array($dateFilter, $allowedDateFilters, true)) {
-    $dateFilter = 'today';
+$availableDateScopeSql = '';
+$availableDateScopeParams = [];
+if ($canSeeAll && !$showAll) {
+    $availableDateScopeSql    = ' WHERE s.department = ?';
+    $availableDateScopeParams = [$collegeFilter];
+} elseif ($canSeeAll) {
+    $availableDateScopeSql    = '';
+    $availableDateScopeParams = [];
+} elseif ($isDean && $staffDept !== '') {
+    $availableDateScopeSql    = ' WHERE s.department = ?';
+    $availableDateScopeParams = [$staffDept];
+} else {
+    $availableDateScopeSql    = ' WHERE COALESCE(s.assigned_to, s.created_by) = ?';
+    $availableDateScopeParams = [$staffId];
 }
+$availableDatesStmt = $db->prepare(
+    'SELECT s.slot_date, COUNT(q.id) AS row_count
+       FROM interview_queue q
+       JOIN interview_slots s ON s.id = q.slot_id'
+    . $availableDateScopeSql .
+    ' GROUP BY s.slot_date
+      ORDER BY s.slot_date ASC'
+);
+$availableDatesStmt->execute($availableDateScopeParams);
+$availableDates = $availableDatesStmt->fetchAll();
+
+$availableDateMap = [];
+foreach ($availableDates as $d) {
+    $availableDateMap[(string)$d['slot_date']] = (int)$d['row_count'];
+}
+
+// Resolve requested filter against the list of dates we actually have.
+$dateFilterRaw = (string)($_GET['date'] ?? '');
+$dateFilter    = 'all';
+if ($dateFilterRaw === 'all') {
+    $dateFilter = 'all';
+} elseif ($dateFilterRaw !== '' && isset($availableDateMap[$dateFilterRaw])) {
+    $dateFilter = $dateFilterRaw;
+} else {
+    // No filter requested (or one that no longer applies) — default
+    // to today if it's in the list, else the soonest upcoming date,
+    // else "all".
+    if (isset($availableDateMap[$today])) {
+        $dateFilter = $today;
+    } else {
+        $futureDate = null;
+        foreach (array_keys($availableDateMap) as $d) {
+            if ($d >= $today) { $futureDate = $d; break; }
+        }
+        $dateFilter = $futureDate ?? 'all';
+    }
+}
+
 $dateWhereSql    = '';
 $dateWhereParams = [];
-switch ($dateFilter) {
-    case 'today':
-        $dateWhereSql    = ' AND s.slot_date = CURDATE()';
-        break;
-    case 'tomorrow':
-        $dateWhereSql    = ' AND s.slot_date = DATE_ADD(CURDATE(), INTERVAL 1 DAY)';
-        break;
-    case 'upcoming':
-        $dateWhereSql    = ' AND s.slot_date >= CURDATE()';
-        break;
-    case 'past':
-        $dateWhereSql    = ' AND s.slot_date < CURDATE()';
-        break;
-    case 'all':
-    default:
-        $dateWhereSql    = '';
-        break;
+if ($dateFilter !== 'all') {
+    $dateWhereSql      = ' AND s.slot_date = ?';
+    $dateWhereParams[] = $dateFilter;
 }
 
 // ----------------------------------------------------------------
@@ -480,23 +517,36 @@ $dateFilterSep = (strpos($dateFilterBaseHref, '?') !== false) ? '&' : '?';
         <input type="search" id="iq-filter" placeholder="Filter by name or course…"
                autocomplete="off">
     </div>
+    <?php
+    // Build dropdown options from the dates that actually have queue
+    // rows in the caller's scope. "All dates" is always offered as an
+    // escape hatch.
+    $dateOptions = [];
+    if (!empty($availableDateMap)) {
+        foreach ($availableDateMap as $d => $cnt) {
+            $isToday    = ($d === $today);
+            $isTomorrow = ($d === date('Y-m-d', strtotime('+1 day')));
+            $isPast     = ($d < $today);
+            $label = format_date($d);
+            if ($isToday)         $label .= ' (Today)';
+            elseif ($isTomorrow)  $label .= ' (Tomorrow)';
+            elseif ($isPast)      $label .= ' (Past)';
+            $label .= ' · ' . $cnt . ' applicant' . ($cnt === 1 ? '' : 's');
+            $dateOptions[$d] = $label;
+        }
+    }
+    $dateOptions['all'] = 'All dates · ' . array_sum($availableDateMap)
+        . ' applicant' . (array_sum($availableDateMap) === 1 ? '' : 's');
+    ?>
     <select id="iq-date-filter"
             style="height:36px;padding:0 var(--space-3);font-size:var(--text-sm);
                    border:1px solid var(--border);border-radius:var(--radius-sm);
-                   background:var(--bg-elevated);color:var(--text-primary)"
+                   background:var(--bg-elevated);color:var(--text-primary);min-width:240px"
             onchange="window.location.href = this.value">
-        <?php
-        $dateOptions = [
-            'today'    => 'Today',
-            'tomorrow' => 'Tomorrow',
-            'upcoming' => 'All upcoming',
-            'past'     => 'Past dates',
-            'all'      => 'All dates',
-        ];
-        foreach ($dateOptions as $val => $label):
-            $href = $dateFilterBaseHref . $dateFilterSep . 'date=' . $val;
+        <?php foreach ($dateOptions as $val => $label):
+            $href = $dateFilterBaseHref . $dateFilterSep . 'date=' . urlencode($val);
         ?>
-            <option value="<?= e($href) ?>" <?= $dateFilter === $val ? 'selected' : '' ?>>
+            <option value="<?= e($href) ?>" <?= (string)$dateFilter === (string)$val ? 'selected' : '' ?>>
                 <?= e($label) ?>
             </option>
         <?php endforeach; ?>
@@ -540,7 +590,12 @@ $dateFilterSep = (strpos($dateFilterBaseHref, '?') !== false) ? '&' : '?';
             //   • Row's slot_date must be today — past/future rows cannot be
             //     evaluated since the interview hasn't actually happened yet
             //     (or the slot has already auto-flipped to no-show).
-            $isTodayRow = isset($r['slot_date']) && (string)$r['slot_date'] === $today;
+            // Evaluation is only allowed on the day of the interview. Both the
+            // "is today" check and the role guard match the server-side check
+            // in modules/interview/staff_action.php so the UI never offers a
+            // button the POST will reject.
+            $rowDate    = isset($r['slot_date']) ? (string)$r['slot_date'] : '';
+            $isTodayRow = $rowDate === $today;
             $canEval    = !$isDean && !$isSSO && $isTodayRow;
         ?>
             <tr class="<?= $rowClass ?>" data-name="<?= e($haystack) ?>">
