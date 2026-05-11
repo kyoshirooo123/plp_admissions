@@ -1163,7 +1163,19 @@ function notify_staff_results_pending(int $count): void
 
 /**
  * Auto-reschedule a no-show applicant to the next available interview slot.
- * Called from record_interview_evaluation() when absent=true.
+ * Called from record_interview_evaluation() when absent=true and from
+ * the live-queue auto-sweep when a slot expires without the applicant
+ * showing up.
+ *
+ * Steps:
+ *   1. Flip the existing queue row to interview_status='absent' (the
+ *      valid ENUM value — note that 'no_show' is NOT a member of the
+ *      interview_status ENUM and would silently fail to update).
+ *   2. Keep the applicant in 'interview' overall_status so the
+ *      bulk-assign filter picks them up.
+ *   3. Call reschedule_absent_applicant() which logs to reschedule_logs,
+ *      deletes the old absent row (UNIQUE INDEX on applicant_id requires
+ *      this), and books a fresh slot via assign_interview_slot().
  */
 function auto_reschedule_noshow(int $applicantId, ?int $actorUserId = null): ?int
 {
@@ -1171,9 +1183,19 @@ function auto_reschedule_noshow(int $applicantId, ?int $actorUserId = null): ?in
 
     $pdo = db();
 
-    // Clear the old queue entry status
+    // Mark the existing queue row absent (covers manual mark-no-show
+    // where the row is still status='in_progress' or 'scheduled' AND
+    // interview_status='pending'). The live-queue auto-sweep already
+    // does this, but this call must be idempotent so it's safe to run
+    // either way.
     $pdo->prepare(
-        'UPDATE interview_queue SET interview_status = "no_show" WHERE applicant_id = ? AND interview_status = "pending"'
+        'UPDATE interview_queue
+            SET interview_status = "absent",
+                attendance_status = "absent",
+                status            = "no_show",
+                evaluated_at      = COALESCE(evaluated_at, NOW())
+          WHERE applicant_id = ?
+            AND interview_status = "pending"'
     )->execute([$applicantId]);
 
     // Ensure applicant stays in interview stage
@@ -1181,9 +1203,11 @@ function auto_reschedule_noshow(int $applicantId, ?int $actorUserId = null): ?in
         'UPDATE applicants SET overall_status = "interview" WHERE id = ? AND overall_status IN ("interview","result")'
     )->execute([$applicantId]);
 
-    // Try to reschedule using the scheduler
+    // Reschedule via the absent-applicant path. This logs reschedule_logs,
+    // deletes the old absent row (required for the UNIQUE INDEX on
+    // applicant_id), and books the next available slot.
     try {
-        $newSlotId = reschedule_interview($applicantId, $actorUserId);
+        $newSlotId = reschedule_absent_applicant($applicantId, null, $actorUserId ?? 0);
         if ($newSlotId) {
             // Notify the student
             $stmt = $pdo->prepare('SELECT user_id FROM applicants WHERE id = ?');

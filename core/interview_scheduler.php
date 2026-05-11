@@ -406,10 +406,34 @@ function bulk_assign_pending_applicants(?string $department = null, ?int $actorU
         return 0;
     }
 
+    // Pre-check whether each applicant has an existing absent/rescheduled
+    // queue row. If they do, we must go through reschedule_absent_applicant
+    // (which deletes the old row + logs reschedule_logs) instead of
+    // assign_interview_slot (which would hit the UNIQUE INDEX on
+    // applicant_id and fail).
+    $absentSet = [];
+    if (!empty($applicantIds)) {
+        try {
+            $marks = implode(',', array_fill(0, count($applicantIds), '?'));
+            $stmt2 = $pdo->prepare(
+                "SELECT applicant_id FROM interview_queue
+                  WHERE applicant_id IN ({$marks})
+                    AND interview_status = 'absent'"
+            );
+            $stmt2->execute($applicantIds);
+            foreach ($stmt2->fetchAll(\PDO::FETCH_COLUMN) ?: [] as $aid) {
+                $absentSet[(int)$aid] = true;
+            }
+        } catch (\Throwable) {}
+    }
+
     $assigned = 0;
     foreach ($applicantIds as $aid) {
         try {
-            if (assign_interview_slot($aid, $actorUserId)) {
+            $newSlotId = isset($absentSet[$aid])
+                ? reschedule_absent_applicant($aid, null, $actorUserId ?? 0)
+                : assign_interview_slot($aid, $actorUserId);
+            if ($newSlotId) {
                 $assigned++;
             } else {
                 // No open slot left — stop early rather than spinning
