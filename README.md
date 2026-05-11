@@ -45,7 +45,22 @@ That single file:
 mysql -u root -p plp_admissions < database/seed_users.sql
 ```
 
-### 4. (Optional) Delete the legacy include files
+### 4. (Optional) Seed demo applicant data
+
+For demos and presentations, load ~120 sample applicants spread across every
+funnel stage (pending docs, exam-taken, interview pipeline, accepted /
+waitlisted / rejected, withdrawn):
+
+```
+mysql -u root -p plp_admissions < database/seed_demo.sql
+```
+
+Every demo student logs in with password `Student@123`. The script is
+idempotent — re-running it clears the previous demo seed first. All dates
+in the data are anchored to whatever day the script is loaded, so "today's
+interview queue" is always populated.
+
+### 5. (Optional) Delete the legacy include files
 
 The setup page no longer uses these two files. They are harmless dead code,
 but if you want a clean tree you can delete them manually:
