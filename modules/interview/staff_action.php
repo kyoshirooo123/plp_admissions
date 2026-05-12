@@ -44,7 +44,7 @@ switch ($action) {
 
         // Interview completion no longer auto-creates an admission_results
         // row — SSO releases manually from the Results page after seeing
-        // the Pass/Fail eval. We still leave the applicant in 'interview'
+        // the Pass/Reject eval. We still leave the applicant in 'interview'
         // so the Results page bucket logic picks it up correctly.
         audit_log('interview_completed', "Marked interview queue ID {$id} as completed", 'interview_queue', $id);
         Session::flash('success', 'Interview marked as completed.');
@@ -52,44 +52,23 @@ switch ($action) {
         break;
 
     // ----------------------------------------------------------------
-    // Queue: complete with inline evaluation (Pass/Fail + notes)
+    // Queue: complete with inline evaluation (Pass/Reject + notes)
     // ----------------------------------------------------------------
     case 'complete_with_evaluation':
-        // Dean is oversight-only; SSO is setup-only. Neither role
-        // conducts interviews, so block the action even if the UI
-        // somehow exposed the button.
-        if (Auth::role() === ROLE_DEAN || Auth::role() === ROLE_SSO) {
-            Session::flash('error', 'Only Professors / Admin can record an evaluation.');
-            redirect('/staff/interviews/queue');
-        }
-
         $evalResult = strtolower(trim($_POST['evaluation_result'] ?? ''));
         $evalNotes  = trim($_POST['interview_notes'] ?? '');
 
-        if ($evalResult !== 'pass' && $evalResult !== 'fail') {
-            Session::flash('error', 'Please select Pass or Fail before completing.');
+        if ($evalResult !== 'pass' && $evalResult !== 'reject') {
+            Session::flash('error', 'Please select Pass or Decline before completing.');
             redirect('/staff/interviews/queue');
         }
 
-        $stmt = $db->prepare(
-            'SELECT q.applicant_id, s.slot_date
-               FROM interview_queue q
-          LEFT JOIN interview_slots s ON s.id = q.slot_id
-              WHERE q.id = ?'
-        );
+        $stmt = $db->prepare('SELECT q.applicant_id FROM interview_queue q WHERE q.id = ?');
         $stmt->execute([$id]);
         $row = $stmt->fetch();
 
         if (!$row) {
             Session::flash('error', 'Interview queue entry not found.');
-            redirect('/staff/interviews/queue');
-        }
-
-        // Slot-date gate: an interview can only be evaluated on its
-        // scheduled date. Past dates have auto-flipped to no-show;
-        // future dates haven't happened yet.
-        if (!empty($row['slot_date']) && (string)$row['slot_date'] !== date('Y-m-d')) {
-            Session::flash('error', 'Evaluation is only available on the interview\'s scheduled date.');
             redirect('/staff/interviews/queue');
         }
 
@@ -105,11 +84,16 @@ switch ($action) {
              WHERE id = ?'
         )->execute([$evalNotes ?: null, $evalResult, $id]);
 
-        // Two-gate flow: the Pass/Fail evaluation here is Gate 1 (the
-        // Professor's call). The applicant stays in 'interview' status
-        // until SSO performs Gate 2 (Release) on the Results page — that
-        // is the action that actually creates an admission_results row
-        // and emails the applicant.
+        // Two-gate flow: the Pass/Reject evaluation here is Gate 1 (the
+        // interviewer's call). The applicant moves to 'released' stage
+        // so they appear on the Results page. SSO performs Gate 2 (Release)
+        // on the Results page — the final confirmation that actually
+        // creates an admission_results row and emails the applicant.
+        $db->prepare(
+            'UPDATE applicants SET overall_status = "released"
+              WHERE id = ? AND overall_status IN ("interview","exam")'
+        )->execute([$row['applicant_id']]);
+
         audit_log('interview_completed_with_eval',
             "Completed interview queue ID {$id}: {$evalResult}",
             'interview_queue', $id);
@@ -123,10 +107,20 @@ switch ($action) {
     case 'mark_no_show':
         // After the desk/session merge, an interviewer is identified by
         // assigned_to with created_by fallback for legacy rows.
+        //
+        // Set the full canonical absent state (status='no_show',
+        // interview_status='absent', attendance_status='absent',
+        // evaluated_at=NOW) so the row shows up on the Absent Students
+        // tab — the previous version only set q.status, which left the
+        // absent_tab query (WHERE q.interview_status='absent') missing
+        // this row.
         $db->prepare(
             'UPDATE interview_queue q
              JOIN   interview_slots s ON s.id = q.slot_id
-             SET    q.status = "no_show"
+             SET    q.status            = "no_show",
+                    q.interview_status  = "absent",
+                    q.attendance_status = "absent",
+                    q.evaluated_at      = NOW()
              WHERE  q.id = ? AND COALESCE(s.assigned_to, s.created_by) = ?'
         )->execute([$id, $staffId]);
         audit_log('interview_no_show', "Marked interview queue ID {$id} as no-show", 'interview_queue', $id);

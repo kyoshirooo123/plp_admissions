@@ -1,469 +1,201 @@
-# PLP Admissions System
+# PLP Admissions — Interview Auto-Assign + Auto-Absent + Wider Reschedule Tables
 
-Pamantasan ng Lungsod ng Pasig — a web-based student admissions system that handles the full pipeline: registration, document submission, entrance exam, interview scheduling, and results release.
+Drag-and-drop on top of your existing `plp-admissions/` folder.
+Every file preserves its original path. No DB migrations required.
 
-**Tech Stack:** PHP (no framework), MySQL/MariaDB, vanilla CSS/JS, XAMPP
+This is the combined drop covering the two follow-ups to the original
+exam auto-assign zip:
 
----
+1. Interview-side auto-assign hardening + wider tables (previous round)
+2. Auto-absent for no-shows (this round)
 
-## Table of Contents
+## What's new in this round
 
-1. [Requirements](#requirements)
-2. [Installation & Setup](#installation--setup)
-3. [Environment Configuration](#environment-configuration)
-4. [User Roles & Default Accounts](#user-roles--default-accounts)
-5. [Admission Process (Step by Step)](#admission-process-step-by-step)
-6. [What Each Role Does](#what-each-role-does)
-7. [Automation Features](#automation-features)
-8. [Frequently Asked Questions](#frequently-asked-questions)
+### Privacy fix — past reschedule requests leaking across students
 
----
+A student visiting `/student/interview` or `/student/exam` was
+seeing **past reschedule requests that belonged to other
+students**. Both pages were filtering only by `applicant_id = ?`
+and trusting whatever `applicant_id` was on the
+`reschedule_requests` / `exam_reschedule_requests` rows. If any row
+had been written with a stray `applicant_id` (legacy data, a bad
+migration, a script that bulk-inserted with the wrong id, etc.),
+it would render on someone else's screen.
 
-## Requirements
+Hardened both queries to **join through `applicants`** and require
+both:
 
-- **XAMPP** (or any local server with PHP 8.0+ and MySQL/MariaDB)
-- **phpMyAdmin** (included with XAMPP) or any MySQL client
-- A web browser (Chrome, Firefox, Edge, etc.)
+- `applicants.user_id = <logged-in user>` — the request's
+  applicant must belong to the current session user, AND
+- `reschedule_requests.applicant_id = <current applicant>` — keep
+  the existing scope.
 
----
+A request can now only render if both constraints hold, so no
+amount of data corruption can leak another student's history into
+this view.
 
-## Installation & Setup
+Files: `modules/interview/student_view.php`,
+`modules/exam/take.php`.
 
-### Step 1: Download and Place the Project
+> If you want to find any actually-corrupted rows in your DB, run:
+> ```sql
+> SELECT rr.id, rr.applicant_id, a.user_id, u.email
+>   FROM reschedule_requests rr
+>   LEFT JOIN applicants a ON a.id = rr.applicant_id
+>   LEFT JOIN users      u ON u.id = a.user_id
+>  WHERE a.id IS NULL;          -- orphan rows
+> ```
+> Same query against `exam_reschedule_requests` for the exam side.
 
-Copy the entire `plp-admissions` folder into your XAMPP web root:
+### Interview queue — date + slot filter dropdowns
+
+`/staff/interviews/queue` toolbar now has two cascading filter
+dropdowns alongside the existing name/course search:
+
+- **Filter by date** — every distinct interview date the table
+  contains. Each entry shows `{date} (Past) · {N} applicants`
+  (past flag only on dates earlier than today). Selecting a date
+  scopes the table to that date.
+- **Filter by slot** — every distinct slot the table contains,
+  formatted as `{date} · {start–end} (Past) · {dept} · {N}
+  applicants`. The slot dropdown **cascades** off the date
+  dropdown — picking a date hides slots on other dates, and
+  clears the slot selection if it no longer matches.
+
+Both filters are pure client-side (rows already include
+`data-slot` + new `data-date` attributes), so there's no extra DB
+query and switching filters is instant. The "X applicants" badge
+on the right of the toolbar always reflects what's currently
+visible.
+
+### Crash fix — Results search box (PDOException HY093)
+
+`/staff/results` was throwing
+`SQLSTATE[HY093]: Invalid parameter number` whenever the search box
+was used. The WHERE clause reused the same `:q` placeholder three
+times (name / email / course), and the project's PDO connection has
+`PDO::ATTR_EMULATE_PREPARES => false` (`config/db.php`), so MySQL
+native prepared statements need a distinct placeholder per position.
+Replaced with `:q1`, `:q2`, `:q3` — same pattern already used in
+`modules/documents/staff_review.php`.
+
+### Auto-absent for no-shows
+
+Before: a student who didn't show up only got `interview_status='absent'`
+when an interviewer explicitly clicked "Mark Absent" on the queue page.
+Auto-routines (`auto_close_expired_sessions`, staff_queue.php inline
+update, and `mark_no_show` itself) only set `q.status='no_show'` and
+left `interview_status` at `'pending'` — which meant the Absent
+Students tab (which filters `WHERE q.interview_status = 'absent'`)
+never saw those students. They were stranded.
+
+After: any queue row whose slot has fully ended without an evaluation
+is now automatically flipped to the **canonical absent state**:
 
 ```
-C:\xampp\htdocs\plp-admissions\
+status            = 'no_show'
+interview_status  = 'absent'
+attendance_status = 'absent'
+evaluated_at      = NOW()
 ```
 
-Your folder structure should look like this:
+…with these triggers:
+
+- **Visiting `/staff/interviews/queue`** — already had an inline
+  auto-no-show update. Now uses the shared helper so all three fields
+  get set, not just `q.status`.
+- **Visiting `/staff/interviews/absent`** (new) — runs the same sweep
+  on page load, so the Absent Students tab is always up to date the
+  moment any SSO / admin / dean opens it.
+- **Dashboard → "Auto-close expired interview sessions"** — already
+  closed the slots; now also marks every unfinished applicant in
+  those slots as absent (the previous code was setting an *invalid
+  enum value* `interview_status='no_show'` which silently dropped on
+  strict MySQL).
+- **Queue → "Mark Absent" button** — manual flip already worked for
+  the queue row, but only set `q.status`; now sets all three fields
+  so the student also lands in the Absent Students tab without a
+  refresh dance.
+
+Every auto-flipped row also fires:
+
+- An in-app notification to the applicant: "Marked absent for your
+  interview" → links to `/student/interview` so they can submit a
+  reschedule request.
+- The existing email template via `send_email()` /
+  `email_template()` — same path as the reschedule-decision emails.
+- The existing `notify_staff_no_show()` so the admissions desk sees
+  it too.
+- A full audit log entry (`interview_auto_no_show`).
+
+Auto-reschedule for no-shows still runs after the flip (controlled by
+`auto_reschedule_noshows` school setting). The path was retargeted at
+`reschedule_absent_applicant()` since the row is now properly absent —
+this also fixes a latent bug where the previous `auto_reschedule_noshow`
+would leave a stale `interview_status='no_show'` (invalid enum) row
+that violated the `uq_applicant_active` unique constraint when trying
+to insert the new pending row.
+
+### What was in the previous round (still included here)
+
+- **Interview auto-assign safety net** on `/student/interview` — every
+  page visit, if the applicant is at the interview stage with no
+  active queue row, retry `assign_interview_slot()`. Mirrors the
+  `modules/exam/take.php` pattern. So the "student sees Waiting →
+  admin creates session → student refreshes → booked" loop works
+  end-to-end with zero staff action.
+- **`backfill_interview_slot_assignments()`** helper in
+  `core/automation.php`, symmetric with the existing exam-side
+  backfill. Walks every applicant at the interview stage without a
+  slot and tries to assign each one, regardless of department
+  matches.
+- **`$pageWide = true;`** on `/staff/exam/reschedule`,
+  `/staff/interviews/absent`, `/staff/exam/cancel-slot`, and
+  `/staff/interviews/cancel-slot` so the tables fill the window
+  instead of being squeezed into the narrow 900px container.
+
+## File list (10 modified)
 
 ```
-htdocs/
-└── plp-admissions/
-    ├── config/
-    ├── core/
-    ├── database/
-    ├── modules/
-    ├── public/
-    ├── views/
-    ├── .env
-    └── ...
+core/automation.php                          MOD  — auto_close_expired_sessions delegates to auto_detect_interview_no_shows;
+                                                     auto_reschedule_noshow rewired to reschedule_absent_applicant;
+                                                     backfill_interview_slot_assignments() helper.
+core/interview_scheduler.php                 MOD  — new auto_detect_interview_no_shows() + _notify_applicant_marked_absent().
+modules/results/staff_manage.php             MOD  — search box no longer crashes (HY093): :q split into :q1/:q2/:q3.
+modules/interview/staff_queue.php            MOD  — inline auto-no-show update replaced with shared helper (all 3 fields);
+                                                     date + slot cascading filter dropdowns added to toolbar.
+modules/interview/staff_action.php           MOD  — mark_no_show sets full canonical absent state, not just q.status.
+modules/interview/staff_absent.php           MOD  — auto-detect on page load + $pageWide = true.
+modules/interview/staff_cancel_slot.php      MOD  — $pageWide = true so the table fills the window.
+modules/interview/student_view.php           MOD  — page-load auto-assign safety net (mirrors modules/exam/take.php).
+modules/exam/staff_reschedule.php            MOD  — $pageWide = true so the table fills the window.
+modules/exam/staff_cancel_slot.php           MOD  — $pageWide = true so the table fills the window.
 ```
 
-### Step 2: Create the Database
-
-1. Open **phpMyAdmin** (go to `http://localhost/phpmyadmin` in your browser)
-2. Click **"New"** on the left sidebar
-3. Enter the database name: `plp_admissions`
-4. Set the collation to `utf8mb4_general_ci`
-5. Click **"Create"**
-
-### Step 3: Import the Database Schema
-
-This creates all the tables the system needs.
-
-**Option A — Using phpMyAdmin:**
-1. Select the `plp_admissions` database
-2. Click the **"Import"** tab
-3. Click **"Choose File"** and select `database/schema.sql`
-4. Click **"Import"** at the bottom
-
-**Option B — Using the command line:**
-```
-mysql -u root -p plp_admissions < database/schema.sql
-```
-
-> **Warning:** `schema.sql` drops all existing tables before recreating them. Back up your data first if you already have records.
-
-### Step 4: Seed the Default User Accounts
-
-This creates the admin, SSO, dean, professor, and proctor accounts so you can log in immediately.
-
-**Option A — Using phpMyAdmin:**
-1. Select the `plp_admissions` database
-2. Click the **"Import"** tab
-3. Click **"Choose File"** and select `database/seed_users.sql`
-4. Click **"Import"** at the bottom
-
-**Option B — Using the command line:**
-```
-mysql -u root -p plp_admissions < database/seed_users.sql
-```
-
-### Step 5: Configure Environment Variables (Optional)
-
-1. Copy `.env.example` to `.env` in the project root
-2. Fill in your values:
-
-```env
-# hCaptcha (get keys from https://dashboard.hcaptcha.com)
-HCAPTCHA_SITE_KEY=your_site_key_here
-HCAPTCHA_SECRET_KEY=your_secret_key_here
-
-# Email notifications (Gmail SMTP — use an App Password)
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=your_email@gmail.com
-SMTP_PASS=your_app_password
-SMTP_FROM_NAME=PLP Admissions
-```
-
-> **Note:** The system works without these. hCaptcha will be disabled on the registration page, and email notifications won't be sent. Everything else functions normally.
-
-### Step 6: Open the System
-
-Go to: **`http://localhost/plp-admissions/public/`**
-
-You should see the login page. Use any of the default accounts listed below to log in.
-
----
-
-## User Roles & Default Accounts
-
-The system has **6 roles**. Each role has different permissions and sees a different set of pages.
-
-### Admin
-
-| | |
-|---|---|
-| **Email** | `admin@plp.edu.ph` |
-| **Password** | `Admin@123` |
-| **What they do** | Full access to everything. Manages users, school year settings, courses, branding, and audit logs. Can do everything that SSO and other roles can do. |
-
-### SSO (Student Success Office)
-
-| | |
-|---|---|
-| **Email** | `sso@plp.edu.ph` |
-| **Password** | `SSO@123` |
-| **What they do** | The main operations role. Reviews student documents, builds the entrance exam, creates exam room slots and interview sessions, and releases admission results. |
-
-### Dean (One per College)
-
-Each dean can only see applicants and data for their own college/department.
-
-| College | Email | Password |
-|---------|-------|----------|
-| College of Computer Studies | `dean.ccs@plp.edu.ph` | `Dean@123` |
-| College of Nursing | `dean.con@plp.edu.ph` | `Dean@123` |
-| College of Business and Accountancy | `dean.cba@plp.edu.ph` | `Dean@123` |
-| College of Education | `dean.coe@plp.edu.ph` | `Dean@123` |
-| College of Arts and Sciences | `dean.cas@plp.edu.ph` | `Dean@123` |
-| College of Engineering | `dean.cen@plp.edu.ph` | `Dean@123` |
-
-**What they do:** Read-only oversight of their college. Can view the dashboard, manage courses and tier thresholds for their department, view interviews, and review results.
-
-### Professor (One per College)
-
-Each professor can only operate within their own college/department.
-
-| College | Email | Password |
-|---------|-------|----------|
-| College of Computer Studies | `staff.ccs@plp.edu.ph` | `Staff@123` |
-| College of Nursing | `staff.con@plp.edu.ph` | `Staff@123` |
-| College of Business and Accountancy | `staff.cba@plp.edu.ph` | `Staff@123` |
-| College of Education | `staff.coe@plp.edu.ph` | `Staff@123` |
-| College of Arts and Sciences | `staff.cas@plp.edu.ph` | `Staff@123` |
-| College of Engineering | `staff.cen@plp.edu.ph` | `Staff@123` |
-
-**What they do:** Conduct student interviews. They see the interview queue, call the next student, evaluate them (pass/fail), and complete the interview process.
-
-### Proctor (One per College)
-
-Each proctor can only operate within their own college/department.
-
-| College | Email | Password |
-|---------|-------|----------|
-| College of Computer Studies | `proctor.ccs@plp.edu.ph` | `Proctor@123` |
-| College of Nursing | `proctor.con@plp.edu.ph` | `Proctor@123` |
-| College of Business and Accountancy | `proctor.cba@plp.edu.ph` | `Proctor@123` |
-| College of Education | `proctor.coe@plp.edu.ph` | `Proctor@123` |
-| College of Arts and Sciences | `proctor.cas@plp.edu.ph` | `Proctor@123` |
-| College of Engineering | `proctor.cen@plp.edu.ph` | `Proctor@123` |
-
-**What they do:** Manage exam-day room operations. They view exam room slots, generate and extend access codes for students, and oversee the exam room. They can only generate codes for rooms in their own department.
-
-### Student
-
-| | |
-|---|---|
-| **How to create** | Register at the login page during the admissions window |
-| **What they do** | Register, upload documents, take the entrance exam, check in for interviews, view results, and confirm enrollment. |
-
-> **Important:** Change all default passwords after first login. These are for initial setup only.
-
----
-
-## Admission Process (Step by Step)
-
-The admission process has 7 phases. Here is exactly what happens at each stage and who is involved.
-
-### Phase 0: System Setup (Admin & SSO — Before Admissions Open)
-
-Before any students can register, the admin and SSO need to set up the system.
-
-**Admin does:**
-1. **Set the Admissions Window** — Go to **School Year** in the sidebar. Set the open date, close date, and optional document submission deadline. The school year is automatically calculated from the open date.
-2. **Configure Courses & Tiers** — Go to **Courses & Strands**. Set passing score thresholds (High/Average/Low tiers) for each course. Set enrollment caps (maximum accepted students per course). Map which SHS strands can apply to which courses.
-3. **Create Staff Accounts** — Go to **Users**. Create accounts for SSO, Deans, Professors, and Proctors. Assign each person to their department/college.
-4. **Configure Branding** (optional) — Go to **Settings**. Set the school name, accent color, and upload a logo.
-
-**SSO does:**
-5. **Build the Entrance Exam** — Go to **Exam** in the sidebar. Create an exam with a title. Add sections with different question types: multiple choice, checkboxes, dropdown, short answer, paragraph, and linear scale. You can enable answer/question shuffling per section.
-6. **Create Exam Room Slots** — Go to **Exam Slots** (via the Exam page). Create time slots with: date, time, room label, department, and capacity. You can batch-create multiple rooms at once.
-7. **Set Up Interview Sessions** — Go to **Interviews → Setup**. Create interview sessions with: date, time window, capacity, assigned interviewer, and location.
-
----
-
-### Phase 1: Student Registration
-
-1. Student visits the system and clicks **"Register"**
-2. Fills in personal information: name, birthdate, sex, address, phone, email, and password
-3. Selects their applicant type: **Freshman**, **Transferee**, or **Foreign**
-4. Selects the course they want to apply for (freshmen see courses filtered by their SHS strand)
-5. Completes hCaptcha verification (if configured)
-6. System creates their account — their status is now **"Pending"**
-
-> **Note:** Registration is only available during the admissions window. If the window is closed, students see a message with the dates.
-
----
-
-### Phase 2: Document Submission (Student)
-
-1. Student logs in and sees their **Documents** page
-2. Uploads required documents (PDF, JPG, PNG, or WEBP — max 5 MB each):
-   - **All applicants:** Government ID, PSA Birth Certificate, Passport Photos, Parent ID, Proof of Income, Guardianship Affidavit
-   - **Freshmen also:** Form 138 or Form 137
-   - **Transferees also:** Transcript of Records, Good Moral Certificate
-   - **Foreign also:** TOR, Good Moral, Passport, Visa/Study Permit, Alien Certificate
-3. Each upload is automatically validated (file format, size, integrity check)
-4. Once all documents are uploaded, the student clicks **"Submit Application"**
-5. Status changes to **"Submitted"**
-
----
-
-### Phase 3: Document Review (SSO / Admin)
-
-1. SSO or Admin goes to **Documents** in the sidebar
-2. Reviews each applicant's uploaded documents
-3. For each document, they can: **Approve**, **Reject** (with reason), or **Request Resubmission** (with instructions)
-4. Bulk actions are available: Approve All Selected, Reject All Selected, Approve All Pending
-5. **When all documents are approved:**
-   - Status automatically advances to **"Exam"**
-   - The system auto-assigns the student to an exam room slot (matched by department, earliest available, first-come-first-served)
-   - Student receives a notification
-
-> **If a document is rejected:** The student's status goes back to "Documents" and they can upload a corrected version.
-
----
-
-### Phase 4: Entrance Exam
-
-**Before exam day — SSO/Admin:**
-- Ensure exam room slots are created with correct dates, times, and capacity
-
-**On exam day — Proctor:**
-1. Proctor logs in and goes to **Exam Slots**
-2. Finds their assigned room and clicks **"Generate Code"** to create an 8-character access code
-3. Announces the code to the room — codes are valid for **5 minutes**
-4. Can click **"Extend +5m"** to extend the code if students need more time to enter it
-5. Can regenerate a fresh code at any time
-
-**On exam day — Student:**
-1. Student logs in and sees their exam assignment (date, time, room)
-2. When the exam time arrives, enters the access code the proctor announced
-3. Takes the exam (Google Forms-style interface with anti-cheating measures)
-4. On submission:
-   - System auto-grades objective questions
-   - Calculates a score and ranks it on a 1–10 scale
-   - Compares rank against the course's passing threshold
-   - Result: **Passed** or **Failed**
-
-**After the exam:**
-- **If passed:** Status advances to **"Interview"** — student is auto-assigned to an interview slot
-- **If failed:** Student stays at "Exam" status and sees their score. SSO/Admin can suggest an alternative course the student may qualify for
-
----
-
-### Phase 5: Interview
-
-**Before interview day — SSO/Admin:**
-- Ensure interview sessions are created and assigned to professors
-
-**On interview day — Student:**
-1. Student sees their interview date, time, and location on the **Interview** page
-2. On the day of the interview, clicks **"I'm Here"** to check in
-3. Waits to be called
-
-**On interview day — Professor:**
-1. Professor logs in and goes to **Interview Queue**
-2. Sees all students for today's session: checked-in, in-progress, completed, no-show
-3. Clicks **"Call Next"** to pull the next checked-in student (first-come, first-served by check-in time)
-4. Conducts the interview
-5. Marks the student as **Pass** or **Fail** with optional notes
-6. Clicks **"Complete"** to finish the interview
-7. Student is automatically set to **"Waitlisted"** status
-
-**No-shows:**
-- Professor marks absent students as no-show
-- No-shows can be rescheduled to a future slot (automatically or manually)
-
----
-
-### Phase 6: Results & Admission Decision (SSO / Dean / Admin)
-
-1. Go to **Results** in the sidebar
-2. See all applicants with filters: All, Pending, Accepted, Waitlisted, Rejected, Withdrawn
-3. For each applicant, choose: **Accept** or **Reject**
-4. Bulk actions: Accept Selected, Waitlist Selected, Reject Selected
-5. **Auto-Release** button: one-click batch decision based on exam scores + interview results:
-   - Exam rank ≥ course threshold AND interview passed → **Accepted**
-   - Exam rank ≥ (threshold − 1) AND interview passed → **Waitlisted**
-   - Otherwise → **Rejected**
-6. Can suggest alternative courses for students who failed their chosen course but qualify for another
-
-**Student sees their result:**
-- **Accepted** — can confirm enrollment intent
-- **Waitlisted** — waiting for a spot to open up
-- **Rejected** — may see a suggested alternative course
-- Students can withdraw at any stage before confirming enrollment
-
----
-
-### Phase 7: Post-Decision
-
-**Waitlist Auto-Promotion:**
-- When an accepted student withdraws, the system automatically promotes the next waitlisted student in the same course
-- Priority: highest exam score first, then earliest document approval date
-- The promoted student receives a notification
-
-**Withdrawal:**
-- Students can withdraw at any stage before confirming enrollment
-- Cannot withdraw after enrollment is confirmed
-- Triggers waitlist auto-promotion for the vacated spot
-
----
-
-## What Each Role Does
-
-### Admin
-| Page | What They Can Do |
-|------|-----------------|
-| Dashboard | View admission pipeline stats, document status breakdown, idle applicant alerts |
-| School Year | Set admissions window dates and document deadline |
-| Courses & Strands | Configure courses, tier thresholds, enrollment caps, SHS strand mappings |
-| Documents | Review and approve/reject student documents |
-| Exam | Build the entrance exam (questions, sections, shuffling) |
-| Exam Slots | Create and manage exam room slots |
-| Interviews | Set up interview sessions, manage the live queue |
-| Results | Review, accept/reject applicants, auto-release results |
-| Users | Create and manage all staff/proctor/dean/SSO accounts |
-| Audit Log | View a log of all actions taken in the system |
-| Settings | Change school name, accent color, logo, and admin password |
-
-### SSO (Student Success Office)
-| Page | What They Can Do |
-|------|-----------------|
-| Dashboard | View admission pipeline stats for all departments |
-| School Year | Set admissions window dates and document deadline |
-| Courses & Strands | Configure courses, tier thresholds, enrollment caps |
-| Documents | Review and approve/reject student documents |
-| Exam | Build the entrance exam |
-| Exam Slots | Create and manage exam room slots for all departments |
-| Interviews | Set up interview sessions |
-| Results | Review, accept/reject applicants, auto-release results |
-| Settings | Change personal password |
-
-### Dean
-| Page | What They Can Do |
-|------|-----------------|
-| Dashboard | View admission pipeline stats for their college only |
-| Courses & Strands | Configure courses and tier thresholds for their college |
-| Interviews | View interview queue (read-only) |
-| Results | View results for their college, suggest alternative courses |
-| Settings | Change personal password |
-
-### Professor
-| Page | What They Can Do |
-|------|-----------------|
-| Dashboard | View admission stats for their department |
-| Interview Queue | Call next student, evaluate (pass/fail), complete interviews, mark no-shows |
-| Settings | Change personal password |
-
-### Proctor
-| Page | What They Can Do |
-|------|-----------------|
-| Dashboard | View admission stats for their department |
-| Exam Slots | View exam room slots, generate/extend access codes for their department's rooms |
-| Settings | Change personal password |
-
-### Student
-| Page | What They Can Do |
-|------|-----------------|
-| Documents | Upload required documents, submit application |
-| Exam | View exam assignment, enter access code, take the exam |
-| Interview | View interview assignment, check in on interview day |
-| Results | View admission result, confirm enrollment, withdraw application |
-| Settings | Change personal password |
-
----
-
-## Automation Features
-
-The system automates several parts of the admissions process:
-
-| Feature | What Triggers It | What Happens |
-|---------|-----------------|--------------|
-| Document auto-validation | Student uploads a file | System checks file format, size, and integrity automatically |
-| Exam slot auto-assignment | All documents approved | Student is assigned to the earliest available exam room in their department |
-| Exam auto-grading | Student submits exam | Objective questions are scored, rank calculated, pass/fail determined |
-| Interview slot auto-assignment | Student passes exam | Student is assigned to the least-filled interview slot in their department |
-| Auto-waitlist after interview | Interview completed | Student is automatically set to "waitlisted" status |
-| Auto-release results | SSO/Admin clicks "Auto Release" | All pending results are batch-decided based on scores + interview |
-| Waitlist auto-promotion | Accepted student withdraws | Next highest-ranked waitlisted student in the same course is promoted |
-| Notifications | Every status change | Students get in-app notifications at each step |
-| Course cap enforcement | Registration + acceptance | Blocks registration/acceptance when a course is full |
-| Document deadline enforcement | Deadline date passes | Blocks uploads for students who haven't submitted yet |
-| Audit logging | Every significant action | Records who did what, when, for accountability |
-
-**Toggleable Settings (Admin can turn these on/off):**
-
-| Setting | Default | What It Controls |
-|---------|---------|-----------------|
-| Auto-validate documents | On | Automatic file validation on upload |
-| Auto-assign exam slots | On | Automatic exam room assignment after doc approval |
-| Auto-promote waitlist | On | Automatic promotion when an accepted student withdraws |
-| Auto-release results | Off | Automatic result release (usually done manually) |
-
----
-
-## Frequently Asked Questions
-
-**Q: I can't log in with the default accounts.**
-A: Make sure you ran `seed_users.sql` after `schema.sql`. The schema file creates tables but does not create user accounts.
-
-**Q: Students can't register — it says admissions are closed.**
-A: An admin needs to set the admissions window first. Log in as admin, go to **School Year**, and set the open and close dates.
-
-**Q: The exam page says "No exam available."**
-A: SSO or Admin needs to create an exam first. Go to **Exam** and create one with at least one section and one question.
-
-**Q: Students aren't being assigned to exam slots automatically.**
-A: Check that (1) exam room slots exist for the student's department, (2) the slots have available capacity, and (3) the auto-assign setting is turned on.
-
-**Q: How do I reset a student's exam or interview?**
-A: This is done through the admin panel by updating the student's status manually in the database.
-
-**Q: The system works without `.env` — is that okay?**
-A: Yes. Without `.env`, hCaptcha is disabled on registration and email notifications won't be sent, but everything else works normally.
-
----
-
-## Notes
-
-- The database defaults to `localhost` / `root` / no password (standard XAMPP). Override with environment variables (`DB_HOST`, `DB_USER`, `DB_PASS`, `DB_NAME`) if your setup is different.
-- The auto-assignment and auto-reschedule logic lives in `core/automation.php` and `core/interview_scheduler.php`.
-- All `/staff/interviews/...` URLs work normally. `/staff/interviews/desks` is an alias for `/staff/interviews/setup` for backward compatibility.
-- File uploads go to the local `uploads/` directory. In production, configure a proper storage path.
+Every file passes `php -l` clean. No new migrations or schema changes.
+
+## Quick smoke test
+
+1. **Auto-absent:**
+   - Find an interview slot whose `end_time` has passed today.
+   - Confirm at least one queue row for that slot is still
+     `status='scheduled'`.
+   - Open `/staff/interviews/absent` as SSO / Admin.
+   - The student should now appear in the Absent Students table
+     immediately, even though no one clicked Mark Absent.
+   - The student should also have an in-app + email notification
+     about being marked absent.
+
+2. **Auto-assign retry (interview side):**
+   - Make a student pass the exam in a department with no interview
+     session — they should land on `/student/interview` with the
+     Waiting card.
+   - Create an interview session for that department.
+   - The student refreshes `/student/interview` — slot appears
+     immediately, no staff action needed.
+
+3. **Wider tables:**
+   - `/staff/exam/reschedule` and
+     `/staff/interviews/absent?tab=requests` should stretch full
+     width on a wide monitor instead of squeezing the table into the
+     middle.

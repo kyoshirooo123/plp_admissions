@@ -67,8 +67,26 @@ try {
 // Pending-work indicators (amber dot, separate semantic from the
 // red "needs setup" dot). Visible only to roles that can act on
 // the queue.
-$_navDocsPending = false;
-$_navResPending  = false;
+$_navDocsPending    = false;
+$_navResPending     = false;
+$_navReschedPending     = false;
+$_navExamReschedPending = false;
+
+// Interview reschedule requests — pending count for SSO/Admin/Dean.
+try {
+    ensure_reschedule_requests_table();
+    $_navReschedPending = (int)$_navDb->query(
+        "SELECT COUNT(*) FROM reschedule_requests WHERE status='pending'"
+    )->fetchColumn() > 0;
+} catch (\Throwable $e) { /* table missing — silent */ }
+
+// Exam reschedule requests — pending count for SSO/Admin.
+try {
+    ensure_exam_reschedule_requests_table();
+    $_navExamReschedPending = (int)$_navDb->query(
+        "SELECT COUNT(*) FROM exam_reschedule_requests WHERE status='pending'"
+    )->fetchColumn() > 0;
+} catch (\Throwable $e) { /* table missing — silent */ }
 
 // Documents — at least one document row in 'uploaded' (= submitted
 // by student, awaiting staff review). Admin / SSO only.
@@ -95,7 +113,7 @@ try {
           WHERE ar.result IS NULL
             AND a.overall_status <> 'withdrawn'
             AND ( er.passed = 0
-               OR iq.evaluation_result IN ('pass','fail') )";
+               OR iq.evaluation_result IN ('pass','reject') )";
 
     if ($isDean) {
         $_navDeanDept = function_exists('user_department')
@@ -115,26 +133,6 @@ try {
         $_navResPending = (int)$_navDb->query($_navResSql)->fetchColumn() > 0;
     }
 } catch (\Throwable $e) { /* tables missing — silent */ }
-
-// Pending reschedule requests — surface a sidebar entry for SSO / Admin
-// when there is anything to review, otherwise the page is unreachable
-// (sidebar "Interviews" lands SSO on /staff/interviews/setup which has
-// no link to /staff/interviews/absent).
-$_navReschedPending = 0;
-$_navAbsentPending  = 0;
-if ($navRole === ROLE_ADMIN || $navRole === ROLE_SSO) {
-    try {
-        $_navReschedPending = (int)$_navDb->query(
-            "SELECT COUNT(*) FROM reschedule_requests WHERE status='pending'"
-        )->fetchColumn();
-    } catch (\Throwable $e) { /* table missing — silent */ }
-    try {
-        $_navAbsentPending = (int)$_navDb->query(
-            "SELECT COUNT(*) FROM interview_queue WHERE interview_status='absent'"
-        )->fetchColumn();
-    } catch (\Throwable $e) { /* table missing — silent */ }
-}
-$_navAbsentHasWork = ($_navReschedPending + $_navAbsentPending) > 0;
 
 // Dean's "Interviews" link goes to the queue page (read-only), since
 // /staff/interviews shows a setup-card landing that's geared toward
@@ -158,13 +156,14 @@ $items = [
         'roles' => [ROLE_ADMIN, ROLE_SSO]],
     ['href' => '/staff/exam',        'key' => 'exam',        'label' => 'Exam',             'icon' => 'ic_fluent_edit_24_regular',          'alert' => !$_navExamReady,
         'roles' => [ROLE_ADMIN, ROLE_SSO]],
+    ['href' => '/staff/exam/reschedule', 'key' => 'exam-reschedule', 'label' => 'Exam Reschedules', 'icon' => 'ic_fluent_arrow_sync_24_regular', 'pending' => $_navExamReschedPending,
+        'roles' => [ROLE_ADMIN, ROLE_SSO]],
     ['href' => $intHref,             'key' => 'interviews',  'label' => 'Interviews',       'icon' => 'ic_fluent_calendar_ltr_24_regular',  'alert' => !$_navIntReady,
         'roles' => [ROLE_ADMIN, ROLE_SSO, ROLE_DEAN]],
-    ['href' => '/staff/interviews/absent' . ($_navReschedPending > 0 ? '?tab=requests' : ''),
-        'key' => 'reschedules', 'label' => 'Reschedules',  'icon' => 'ic_fluent_arrow_sync_24_regular',  'pending' => $_navAbsentHasWork,
-        'roles' => [ROLE_ADMIN, ROLE_SSO]],
-    ['href' => '/staff/results',     'key' => 'results',     'label' => 'Results',          'icon' => 'ic_fluent_ribbon_star_24_regular',   'pending' => $_navResPending,
+    ['href' => '/staff/interviews/absent?tab=requests', 'key' => 'reschedule', 'label' => 'Interview Reschedules', 'icon' => 'ic_fluent_arrow_sync_24_regular', 'pending' => $_navReschedPending,
         'roles' => [ROLE_ADMIN, ROLE_SSO, ROLE_DEAN]],
+    ['href' => '/staff/results',     'key' => 'results',     'label' => 'Results',          'icon' => 'ic_fluent_ribbon_star_24_regular',   'pending' => $_navResPending,
+        'roles' => [ROLE_ADMIN, ROLE_DEAN]],
 
     ['href' => '/admin/users',       'key' => 'users',       'label' => 'Users',            'icon' => 'ic_fluent_shield_24_regular',
         'roles' => [ROLE_ADMIN]],
