@@ -208,8 +208,10 @@ applicants in their college. Most narrowly scoped of the staff roles.
 - **Read:** their own assigned interview sessions, the queue rows for
   their sessions, the applicant card for any applicant in their queue.
 - **Update:** their own interview sessions (date, time, capacity,
-  location), the queue rows on interview day (Call Next, Mark Absent,
-  Evaluate Pass / Decline).
+  location), the queue rows on interview day (Evaluate Pass /
+  Decline). The queue is first-come, first-served by `queue_number` —
+  there is no "Call Next" button and no manual "No-show" button in
+  the UI.
 - **Delete:** their own future interview sessions (cannot delete
   sessions with checked-in applicants).
 - **Approve / Decline:** interview evaluations — stored as `pass` /
@@ -479,10 +481,18 @@ applicants in the department into the new slot.
 `modules/interview/staff_queue.php`:
 
 - Scoped per role (see Section 5 of **Full Flow & Reference**).
+- Queue ordering is automatic — `in_progress` rows on top, then
+  `checked_in` / `scheduled` by `queue_number ASC`, then
+  `completed` / `no_show` at the bottom. **There is no "Call Next"
+  button** in the UI; the next applicant is whoever sits at the top.
+  The legacy `staff_call_next.php` endpoint is dead code.
 - **Auto no-show**: every page load runs an UPDATE that flips any
   still-waiting / in-progress row past its slot's end time to
-  `no_show` + `absent`. **No manual "No-show" button** in the UI.
-- **Call Next** flips the next `checked_in` row to `in_progress`.
+  `status=no_show` + `interview_status=absent` +
+  `attendance_status=absent`. **No manual "No-show" button** in the UI.
+- **Auto-reschedule**: auto no-shows are routed to the next available
+  slot via `auto_reschedule_noshow()` when
+  `auto_reschedule_noshows = '1'` (default on).
 - **Evaluate** records `evaluation_result` (Pass / Decline — stored as
   `pass` / `reject`), sets `interview_completed_at`, AND flips
   `overall_status = 'released'` so the applicant shows up on Results.
@@ -553,9 +563,10 @@ Three ways to release:
 ### 4.4 Interview Module
 
 - **Files:** `modules/interview/staff_setup.php`,
-  `staff_queue.php`, `staff_call_next.php`, `staff_action.php`,
+  `staff_queue.php`, `staff_action.php`,
   `staff_absent.php`, `staff_cancel_slot.php`,
-  `student_view.php`.
+  `student_view.php`. (`staff_call_next.php` exists but is dead
+  code — no UI references it.)
 - **Helpers:** `core/interview_scheduler.php`.
 
 ### 4.5 Results Module
@@ -921,15 +932,19 @@ A student can be moved out of an exam or interview slot via
 1. Log in. Land on `/staff/dashboard`.
 2. Open `/staff/interviews/setup` to add interview sessions for your
    college.
-3. On interview day, open `/staff/interviews/queue`. Click **Call
-   Next** to bring up the next student.
-4. Click into the applicant card to see their profile, exam score,
-   and documents.
-5. Open the **Evaluate** modal, write notes, pick **Pass** or
-   **Decline**. This is a recommendation — the Dean releases the
-   actual result.
-6. No-shows are flagged automatically when the slot ends — there's
-   no manual "No-show" button.
+3. On interview day, open `/staff/interviews/queue`. The queue is
+   first-come, first-served by `queue_number` — **there is no "Call
+   Next" button**. The next student is whoever sits at the top of the
+   list; once you finish the current applicant, the next moves up
+   automatically.
+4. Click the applicant's name to see their profile, exam score, and
+   documents in the side drawer.
+5. Click the **Evaluation** button on the row, write notes, pick
+   **Pass** or **Decline**. This is a recommendation — the Dean
+   releases the actual result.
+6. No-shows are flagged automatically when the slot ends — there is
+   **no manual "No-show" button** — and the system auto-reschedules
+   them to the next available slot.
 
 ### 10.5 Proctor Guide (NEW)
 

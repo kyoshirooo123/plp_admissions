@@ -361,18 +361,25 @@ waiting applicant into the new slot.
   - **Admin / SSO** → can pick a college or see everything via
     `?college=__all__`.
 - **Actions:**
-  - **Call Next** flips the next `checked_in` row to `in_progress`.
+  - **Queue ordering is automatic** — the rows on the page are already
+    ordered `in_progress` first, then `checked_in` / `scheduled` by
+    `queue_number ASC`, then `completed` / `no_show` at the bottom
+    (`staff_queue.php` line 187). There is **no "Call Next" button**
+    anywhere in the UI; the next applicant is whoever sits at the top.
+    The legacy `staff_call_next.php` endpoint is dead code.
   - **Evaluate** records `evaluation_result` (Pass / Decline, stored
     as `pass` / `reject`) on the queue row, sets
     `interview_completed_at` on the applicant, AND immediately flips
     `overall_status` to `released` so the applicant shows up on the
     Results page in the matching Recommended bucket.
-  - **Mark Absent** sets `attendance_status = 'absent'`. Auto-reschedule
-    (`auto_reschedule_noshows`) can route them to the next available
-    slot.
   - **Auto no-show**: every page load runs an UPDATE that flips any
-    still-waiting / in-progress row past its end time to
-    `no_show` + `absent`. There is no manual "No-show" button.
+    still-waiting / in-progress row past its slot's end time to
+    `status=no_show` + `interview_status=absent` +
+    `attendance_status=absent`. There is **no manual "No-show" button**
+    in the queue UI either — it's fully automatic.
+  - **Auto-reschedule**: auto no-shows are then routed to the next
+    available slot in their department via `auto_reschedule_noshow()`
+    when `school_settings.auto_reschedule_noshows = '1'` (default on).
 
 The applicant page (`/student/interview`) is read-only — it shows their
 date, time, location, interviewer, and a live queue position computed
@@ -791,7 +798,7 @@ context):
 | `/staff/exam/export-rooms`                      | `modules/exam/staff_export_rooms.php`                   |
 | `/staff/interviews/setup`                       | `modules/interview/staff_setup.php`                     |
 | `/staff/interviews/queue`                       | `modules/interview/staff_queue.php`                     |
-| `POST /staff/interviews/call-next`              | `modules/interview/staff_call_next.php`                 |
+| `POST /staff/interviews/call-next`              | `modules/interview/staff_call_next.php` (dead endpoint — no UI calls it) |
 | `POST /staff/interviews/{id}`                   | `modules/interview/staff_action.php`                    |
 | `/staff/interviews/absent`                      | `modules/interview/staff_absent.php`                    |
 | `/staff/interviews/cancel-slot`                 | `modules/interview/staff_cancel_slot.php`               |

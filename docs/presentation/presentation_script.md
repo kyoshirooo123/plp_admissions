@@ -736,32 +736,38 @@ sessions, in queue-number order.
 **What the user can do:**
 
 - See all checked-in applicants in their own sessions
-  (`COALESCE(s.assigned_to, s.created_by) = self`), in queue-number
-  order.
+  (`COALESCE(s.assigned_to, s.created_by) = self`), already ordered
+  for them — in-progress on top, then waiting (`checked_in` /
+  `scheduled`) by `queue_number ASC`, then completed / no-show at the
+  bottom (`staff_queue.php` line 187 — the FIELD-ordered ORDER BY).
 - Filter by date / by session — only dates with rows in the user's
   scope appear (no dead options).
-- Click **Call Next** — picks the lowest-`queue_number` `checked_in`
-  row on today's slots they own and advances it to `in_progress`. If
-  nobody is waiting, the page flashes *"No applicants are waiting in
-  the queue."*
-- Click into an applicant → the side drawer shows name, course,
-  applicant type, exam pass/fail with score, documents, and an inline
-  notes field.
-- Record evaluation via the modal — `evaluation_result` is **Pass** or
-  **Decline** (stored as `pass` / `reject`); `interview_notes` is free
-  text.
-- `mark_absent` records a manual absence (full canonical absent state:
-  `status=no_show`, `interview_status=absent`,
-  `attendance_status=absent`, `evaluated_at=NOW()`).
+- Click into the applicant's name → opens the side drawer with name,
+  course, applicant type, exam pass/fail with score, documents, and
+  an inline notes field.
+- Click the **Evaluation** button on a row to open the evaluation
+  modal — write notes, then click **Pass** or **Decline**
+  (`evaluation_result` is stored as `pass` / `reject`).
 
 **What the system automatically does:**
 
+- The queue is **first-come, first-served by queue number**. There is
+  **no "Call Next" button anywhere in the UI** — the next applicant
+  is whoever sits at the top of the list. The legacy
+  `staff_call_next.php` endpoint exists in the codebase but is dead
+  code; nothing in `staff_queue.php` references or renders it.
 - Students are auto-checked-in at slot-assignment time — there is no
-  "I'm Here" or manual check-in step.
+  "I'm Here" or manual check-in step (see `assign_interview_slot()`
+  in `core/interview_scheduler.php`).
 - **Auto no-show**: every page load runs an UPDATE that flips any
-  still-waiting / in-progress row past its end time to
-  `no_show` + `absent`. There is **no manual "No-show" button** in the
-  queue UI.
+  still-waiting / in-progress row past its slot's end time to
+  `status=no_show` + `interview_status=absent` +
+  `attendance_status=absent`. There is **no manual "No-show" button**
+  in the queue UI either (`staff_queue.php` lines 13–17 are explicit
+  about this).
+- Auto no-shows are then **auto-rescheduled** to the next available
+  slot in that department via `auto_reschedule_noshow()` (when
+  `school_settings.auto_reschedule_noshows = '1'`, default on).
 - On evaluation, the row gets `status=completed`, `interview_status=completed`,
   `attendance_status=present`, `evaluated_at=NOW()`, AND
   `applicants.overall_status` immediately flips to `released` so the
@@ -770,23 +776,25 @@ sessions, in queue-number order.
   required it to be the slot's scheduled date; that gate has been
   removed.
 
-> Important: this is a **recommendation**. The Dean is the one who
-> actually releases the result (see Sections 2.8 and 3.4).
+> Important: Pass / Decline is a **recommendation only**. The Dean is
+> the one who actually releases the result (see Sections 2.8 and 3.4).
 
 #### Speaker Script (Tagalog)
 
 > "Ito po ang pinakamahalaga para sa Professor — ang Live Queue. Sa
-> interview day, bubuksan niya ito at makikita niya ang mga students
-> na naka-assign sa kanyang sessions, in queue-number order.
+> interview day, bubuksan niya ito at makikita niya ang lahat ng
+> students na naka-assign sa kanyang sessions, sa queue-number order.
 >
-> I-click niya ang Call Next para sumalang ang susunod na student.
-> Pagkatapos ng interview, magbu-buksan siya ng Evaluation modal,
-> magla-lagay ng notes, at pipiliin Pass o Decline. Recommendation lang
-> po ito — ang Dean po ang gumagawa ng final decision.
+> First come, first served po — walang manual na 'Call Next' button.
+> Pagdating ng student at wala pang iniinterview, sasalang na siya
+> agad. Pagkatapos, susunod naman ang next sa pila. Ina-evaluate po
+> ng Professor ang applicant — magla-lagay ng notes, at pipiliin Pass
+> o Decline. Recommendation lang po ito — ang Dean po ang gumagawa
+> ng final decision.
 >
-> Pag hindi dumating ang student, walang manual na No-show button —
-> automatic po na nai-flag siya as no-show kapag tapos na ang slot.
-> Pwede po naman magmark ng manual absent kung kailangan."
+> Pag hindi po dumating ang student, automatic na ima-flag siya as
+> no-show o absent kapag tapos na ang slot — at automatic din pong
+> marereschedule siya sa next available slot."
 
 #### Speaker Script (English)
 
@@ -794,14 +802,16 @@ sessions, in queue-number order.
 > Queue. On interview day, the Professor opens this and sees every
 > student assigned to their sessions, in queue-number order.
 >
-> Clicking Call Next pulls up the next applicant. After the interview,
-> the Professor opens the Evaluation modal, writes notes, and picks
-> Pass or Decline. This is a recommendation only — the Dean makes the
-> final decision.
+> It's first come, first served — there is no manual 'Call Next'
+> button. The next applicant in the queue is up automatically; once
+> the Professor finishes the current one, the next person in line
+> moves up on their own. The Professor evaluates the applicant on the
+> spot, writes notes, and picks Pass or Decline. This is a
+> recommendation only — the Dean makes the final decision.
 >
-> If a student doesn't show, there's no manual No-show button — the
-> system automatically flags them as no-show once the slot ends. There
-> is still a manual mark-absent button for edge cases."
+> If a student doesn't show, the system automatically flags them as
+> no-show or absent once the slot ends — and auto-reschedules them to
+> the next available slot."
 
 ---
 
