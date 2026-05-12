@@ -139,329 +139,320 @@ function send_registration_email(string $email, string $name): void
 }
 
 // ----------------------------------------------------------------
-// DOCUMENT AUTO-VALIDATION
-// ----------------------------------------------------------------
-
-/**
- * Auto-validate a document using OCR-style checks:
- *  Step 1: File format + size validation
- *  Step 2: Image integrity check (not corrupted, minimum resolution)
- *  Step 3: PDF structure + text extraction (verify it has readable content)
- *  Step 4: Minimum file size heuristic (very small files are likely blank/invalid)
- *
- * If OCR checks pass → auto-approve.
- * If OCR checks fail → mark failed.
- * If OCR checks are uncertain → flag for manual review (staff can use AI fallback).
- *
- * Returns: 'passed' | 'failed' | 'uncertain'
- */
-function auto_validate_document(int $documentId): string
-{
-    if (school_setting('auto_validate_documents', '1') !== '1') {
-        return 'uncertain';
-    }
-
-    $pdo = db();
-    $stmt = $pdo->prepare(
-        'SELECT d.*, a.applicant_type
-         FROM documents d
-         JOIN applicants a ON a.id = d.applicant_id
-         WHERE d.id = ?'
-    );
-    $stmt->execute([$documentId]);
-    $doc = $stmt->fetch();
-    if (!$doc || !$doc['file_path']) return 'uncertain';
-
-    $result = 'uncertain';
-    $confidence = 0;
-    $details = [];
-
-    $filePath = $doc['file_path'];
-    $isUrl = str_starts_with($filePath, 'http');
-
-    if (!$isUrl) {
-        $fullPath = PUBLIC_PATH . $filePath;
-        if (!file_exists($fullPath)) {
-            $details['file_check'] = 'File not found on disk';
-            log_document_validation($documentId, 'ocr', 'uncertain', 0, $details);
-            return 'uncertain';
-        }
-
-        $fileSize = filesize($fullPath);
-        $finfo = new finfo(FILEINFO_MIME_TYPE);
-        $mimeType = $finfo->file($fullPath);
-
-        // ── Step 1: File format + size ────────────────────────
-        $validMimes = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
-        if (!in_array($mimeType, $validMimes, true)) {
-            $details['step1_format'] = 'FAIL: Invalid file type ' . $mimeType;
-            log_document_validation($documentId, 'ocr', 'failed', 0, $details);
-            return 'failed';
-        }
-        if ($fileSize > MAX_UPLOAD_BYTES) {
-            $details['step1_format'] = 'FAIL: File too large (' . round($fileSize / 1024 / 1024, 2) . ' MB)';
-            log_document_validation($documentId, 'ocr', 'failed', 0, $details);
-            return 'failed';
-        }
-        // Very small files (< 5 KB) are suspicious — likely blank or placeholder
-        if ($fileSize < 5120) {
-            $details['step1_format'] = 'WARN: File very small (' . $fileSize . ' bytes)';
-            $confidence = 30;
-        } else {
-            $details['step1_format'] = 'OK: ' . $mimeType . ', ' . round($fileSize / 1024) . ' KB';
-            $confidence = 50;
-        }
-
-        // ── Step 2: Image integrity ──────────────────────────
-        if (str_starts_with($mimeType, 'image/')) {
-            $imgInfo = @getimagesize($fullPath);
-            if ($imgInfo === false) {
-                $details['step2_integrity'] = 'FAIL: Corrupted or invalid image';
-                log_document_validation($documentId, 'ocr', 'failed', 10, $details);
-                return 'failed';
-            }
-
-            $width = $imgInfo[0];
-            $height = $imgInfo[1];
-            $details['step2_integrity'] = "OK: {$width}x{$height}";
-
-            // Document images should have reasonable resolution
-            if ($width < 200 || $height < 200) {
-                $details['step2_integrity'] .= ' WARN: Very low resolution';
-                $confidence = max($confidence, 40);
-            } elseif ($width >= 600 && $height >= 400) {
-                $confidence = max($confidence, 75);
-            } else {
-                $confidence = max($confidence, 60);
-            }
-        }
-
-        // ── Step 3: PDF structure + text extraction ──────────
-        if ($mimeType === 'application/pdf') {
-            $header = file_get_contents($fullPath, false, null, 0, 5);
-            if ($header !== '%PDF-') {
-                $details['step3_pdf'] = 'FAIL: Invalid PDF header';
-                log_document_validation($documentId, 'ocr', 'failed', 10, $details);
-                return 'failed';
-            }
-
-            // Try to extract text from PDF (basic OCR for text-based PDFs)
-            $pdfText = extract_pdf_text($fullPath);
-            if ($pdfText !== null) {
-                $textLen = mb_strlen(trim($pdfText));
-                if ($textLen > 20) {
-                    $details['step3_pdf'] = 'OK: PDF has readable text (' . $textLen . ' chars)';
-                    $confidence = max($confidence, 80);
-                } elseif ($textLen > 0) {
-                    $details['step3_pdf'] = 'OK: PDF has minimal text (' . $textLen . ' chars) — likely scanned';
-                    $confidence = max($confidence, 65);
-                } else {
-                    $details['step3_pdf'] = 'OK: PDF valid but no extractable text — scanned document';
-                    $confidence = max($confidence, 60);
-                }
-            } else {
-                $details['step3_pdf'] = 'OK: Valid PDF structure (text extraction not available)';
-                $confidence = max($confidence, 65);
-            }
-        }
-    } else {
-        // Remote file (Uploadcare CDN) - format validated at upload time
-        $details['step1_format'] = 'OK: Remote file (CDN) — validated at upload';
-        $confidence = 70;
-    }
-
-    // ── Determine result from OCR confidence ──────────────
-    if ($confidence >= 70) {
-        $result = 'passed';
-    } elseif ($confidence <= 30) {
-        $result = 'failed';
-    } else {
-        $result = 'uncertain'; // Flag for manual review; staff can use AI fallback
-    }
-
-    log_document_validation($documentId, 'ocr', $result, $confidence, $details);
-    return $result;
-}
-
-/**
- * Extract text from a PDF file (basic OCR for text-based PDFs).
- * Returns extracted text, or null if extraction is not possible.
- */
-function extract_pdf_text(string $pdfPath): ?string
-{
-    // Method 1: Try pdftotext command-line tool (poppler-utils)
-    $cmd = 'pdftotext ' . escapeshellarg($pdfPath) . ' - 2>/dev/null';
-    $output = @shell_exec($cmd);
-    if ($output !== null && trim($output) !== '') {
-        return trim($output);
-    }
-
-    // Method 2: Basic text extraction from PDF stream objects
-    $content = @file_get_contents($pdfPath);
-    if ($content === false) return null;
-
-    $text = '';
-    // Extract text between BT (begin text) and ET (end text) markers
-    if (preg_match_all('/BT\s*(.*?)\s*ET/s', $content, $matches)) {
-        foreach ($matches[1] as $block) {
-            // Extract text from Tj (show text) and TJ (show text array) operators
-            if (preg_match_all('/\(([^)]*)\)\s*Tj/s', $block, $tj)) {
-                $text .= implode(' ', $tj[1]);
-            }
-            if (preg_match_all('/\[([^\]]*)\]\s*TJ/s', $block, $tjarr)) {
-                foreach ($tjarr[1] as $arr) {
-                    if (preg_match_all('/\(([^)]*)\)/s', $arr, $parts)) {
-                        $text .= implode('', $parts[1]);
-                    }
-                }
-            }
-        }
-    }
-
-    // Clean up extracted text
-    $text = preg_replace('/[^\x20-\x7E\x0A\x0D]/', '', $text);
-    return trim($text) !== '' ? trim($text) : '';
-}
-
-/**
- * Save AI validation result from client-side Puter AI.
- * Called via AJAX after the Puter JS SDK returns a result in the browser.
- */
-function save_ai_validation(int $documentId, string $status, float $confidence, string $reason): void
-{
-    $details = ['ai_reason' => $reason, 'source' => 'puter_client'];
-
-    log_document_validation($documentId, 'ai', $status, $confidence, $details);
-
-    // Auto-approve if AI says it's valid with high confidence
-    if ($status === 'passed') {
-        $pdo = db();
-        $stmt = $pdo->prepare('SELECT status FROM documents WHERE id = ?');
-        $stmt->execute([$documentId]);
-        $doc = $stmt->fetch();
-        if ($doc && in_array($doc['status'], ['uploaded', 'under_review'], true)) {
-            $pdo->prepare('UPDATE documents SET status = ? WHERE id = ?')
-                ->execute(['approved', $documentId]);
-        }
-    }
-}
-
-/**
- * Log document validation result.
- */
-function log_document_validation(int $documentId, string $type, string $status, float $confidence, array $details): void
-{
-    try {
-        ensure_document_validations_table();
-        db()->prepare(
-            'INSERT INTO document_validations (document_id, validation_type, status, confidence, details)
-             VALUES (?, ?, ?, ?, ?)'
-        )->execute([$documentId, $type, $status, $confidence, json_encode($details)]);
-    } catch (\Throwable $e) {
-        error_log('Validation log error: ' . $e->getMessage());
-    }
-}
-
-// ----------------------------------------------------------------
 // AUTO-ASSIGN EXAM SLOTS
 // ----------------------------------------------------------------
 
 /**
  * Auto-assign an applicant to the next available exam slot.
- * Called after all documents are approved.
+ *
+ * Called automatically after all documents are approved, and as a
+ * backfill from a handful of safety-net code paths (exam page open,
+ * new slot created, manual advance-to-exam, etc.) so an applicant
+ * who was advanced before any matching slot existed will still get
+ * assigned the moment one does.
+ *
+ * Hardening over the original version:
+ *   - Wraps the slot pick + insert in a transaction with FOR UPDATE
+ *     so two concurrent approvals can't both grab the last seat.
+ *   - Skips withdrawn applicants and anyone not actually at the
+ *     exam stage.
+ *   - Skips slots whose date is today AND whose start time has
+ *     already passed.
+ *   - Honors the same exam (when exam_id is set on the slot) and
+ *     prefers the active exam.
+ *   - Falls back when the department field is blank or mistyped
+ *     instead of giving up.
  */
 function auto_assign_exam_slot(int $applicantId): ?int
 {
     if (school_setting('auto_assign_exam_slots', '1') !== '1') return null;
+    if ($applicantId <= 0) return null;
 
     $pdo = db();
 
-    // Check if already assigned
-    $stmt = $pdo->prepare('SELECT id FROM applicant_exam_slots WHERE applicant_id = ?');
-    $stmt->execute([$applicantId]);
-    if ($stmt->fetch()) return null;
-
-    // Get applicant's department
+    // ----------------------------------------------------------------
+    // Pre-checks (cheap, no locks).
+    // ----------------------------------------------------------------
     $stmt = $pdo->prepare(
-        'SELECT a.course_applied, u.department
-         FROM applicants a JOIN users u ON u.id = a.user_id
-         WHERE a.id = ?'
+        'SELECT a.id, a.overall_status, a.course_applied, u.department
+           FROM applicants a
+           JOIN users      u ON u.id = a.user_id
+          WHERE a.id = ?
+          LIMIT 1'
     );
     $stmt->execute([$applicantId]);
     $appl = $stmt->fetch();
     if (!$appl) return null;
+    if (($appl['overall_status'] ?? '') === 'withdrawn') return null;
+    // Only assign students who are currently at the exam stage. If a
+    // caller fires this for someone still at documents/submitted we
+    // skip rather than booking them prematurely.
+    if (!in_array($appl['overall_status'] ?? '', ['exam'], true)) return null;
 
-    $dept = $appl['department'] ?: course_to_department($appl['course_applied']);
+    $stmt = $pdo->prepare('SELECT id FROM applicant_exam_slots WHERE applicant_id = ? LIMIT 1');
+    $stmt->execute([$applicantId]);
+    if ($stmt->fetch()) return null;
 
-    // Find next available slot (matching department, future date, has capacity)
-    $stmt = $pdo->prepare(
-        'SELECT ess.id, ess.capacity, ess.filled
-         FROM exam_slot_schedule ess
-         WHERE ess.department = ?
-           AND ess.exam_date >= CURDATE()
-           AND ess.filled < ess.capacity
-         ORDER BY ess.exam_date ASC, ess.slot_time ASC
-         LIMIT 1'
-    );
-    $stmt->execute([$dept]);
-    $slot = $stmt->fetch();
+    $dept = trim((string)($appl['department'] ?? ''))
+          ?: course_to_department((string)($appl['course_applied'] ?? ''));
 
-    // If no dept-specific slot, try any slot
-    if (!$slot) {
-        $stmt = $pdo->prepare(
-            'SELECT ess.id, ess.capacity, ess.filled
-             FROM exam_slot_schedule ess
-             WHERE ess.exam_date >= CURDATE()
-               AND ess.filled < ess.capacity
-             ORDER BY ess.exam_date ASC, ess.slot_time ASC
-             LIMIT 1'
-        );
-        $stmt->execute();
-        $slot = $stmt->fetch();
-    }
-
-    if (!$slot) return null;
-
-    $slotId = (int) $slot['id'];
-
+    // Active exam (if any) — when multiple exams coexist we prefer
+    // slots tied to the active one so applicants don't get booked
+    // into a stale exam.
+    $activeExamId = null;
     try {
-        $pdo->prepare(
-            'INSERT INTO applicant_exam_slots (applicant_id, slot_id) VALUES (?, ?)'
-        )->execute([$applicantId, $slotId]);
+        $activeExamId = (int)($pdo->query('SELECT id FROM exams WHERE is_active = 1 ORDER BY id DESC LIMIT 1')
+                              ->fetchColumn() ?: 0) ?: null;
+    } catch (\Throwable) {}
 
-        $pdo->prepare(
-            'UPDATE exam_slot_schedule SET filled = filled + 1 WHERE id = ?'
-        )->execute([$slotId]);
+    // ----------------------------------------------------------------
+    // Candidate-slot search, in priority order:
+    //   1. Same department + active exam
+    //   2. Same department + any exam
+    //   3. Department-agnostic ('' dept) + active exam
+    //   4. Any open slot
+    //
+    // Each query already filters out past slots (date < today, or
+    // date = today AND slot_time <= now).
+    // ----------------------------------------------------------------
+    $today   = date('Y-m-d');
+    $nowTime = date('H:i:s');
 
-        // Get slot details for notification
-        $stmt = $pdo->prepare('SELECT exam_date, slot_time, room_label FROM exam_slot_schedule WHERE id = ?');
-        $stmt->execute([$slotId]);
-        $slotInfo = $stmt->fetch();
-
-        if ($slotInfo) {
-            $dateStr = date('F j, Y', strtotime($slotInfo['exam_date']));
-            $timeStr = date('g:i A', strtotime($slotInfo['slot_time']));
-            $room = $slotInfo['room_label'];
-
-            $stmt = $pdo->prepare('SELECT user_id FROM applicants WHERE id = ?');
-            $stmt->execute([$applicantId]);
-            $userId = (int) $stmt->fetchColumn();
-
-            create_notification(
-                $userId,
-                'exam_slot_assigned',
-                'Exam Slot Assigned',
-                "You have been assigned to take the exam on {$dateStr} at {$timeStr} in {$room}.",
-                '/student/exam'
-            );
-        }
-
-        audit_log('exam_slot_auto_assigned', "Auto-assigned applicant {$applicantId} to slot {$slotId}", 'applicant', $applicantId);
-        return $slotId;
-    } catch (\Throwable $e) {
-        error_log('Auto-assign exam slot error: ' . $e->getMessage());
-        return null;
+    $candidates = [];
+    $queries = [];
+    if ($dept !== '' && $activeExamId !== null) {
+        $queries[] = [
+            'sql' => 'SELECT id FROM exam_slot_schedule
+                       WHERE department = ?
+                         AND exam_id = ?
+                         AND filled < capacity
+                         AND (exam_date > ? OR (exam_date = ? AND slot_time > ?))
+                       ORDER BY exam_date ASC, slot_time ASC',
+            'params' => [$dept, $activeExamId, $today, $today, $nowTime],
+        ];
     }
+    if ($dept !== '') {
+        $queries[] = [
+            'sql' => 'SELECT id FROM exam_slot_schedule
+                       WHERE department = ?
+                         AND filled < capacity
+                         AND (exam_date > ? OR (exam_date = ? AND slot_time > ?))
+                       ORDER BY exam_date ASC, slot_time ASC',
+            'params' => [$dept, $today, $today, $nowTime],
+        ];
+    }
+    if ($activeExamId !== null) {
+        $queries[] = [
+            'sql' => 'SELECT id FROM exam_slot_schedule
+                       WHERE exam_id = ?
+                         AND filled < capacity
+                         AND (exam_date > ? OR (exam_date = ? AND slot_time > ?))
+                       ORDER BY exam_date ASC, slot_time ASC',
+            'params' => [$activeExamId, $today, $today, $nowTime],
+        ];
+    }
+    $queries[] = [
+        'sql' => 'SELECT id FROM exam_slot_schedule
+                   WHERE filled < capacity
+                     AND (exam_date > ? OR (exam_date = ? AND slot_time > ?))
+                   ORDER BY exam_date ASC, slot_time ASC',
+        'params' => [$today, $today, $nowTime],
+    ];
+
+    foreach ($queries as $q) {
+        $stmt = $pdo->prepare($q['sql']);
+        $stmt->execute($q['params']);
+        $rows = $stmt->fetchAll();
+        if ($rows) {
+            $candidates = $rows;
+            break;
+        }
+    }
+
+    if (!$candidates) return null;
+
+    // ----------------------------------------------------------------
+    // Try each candidate inside its own transaction. The FOR UPDATE
+    // lock guarantees the capacity check + INSERT are atomic — if
+    // someone else grabbed the last seat between SELECT and INSERT
+    // we move on to the next candidate.
+    // ----------------------------------------------------------------
+    foreach ($candidates as $row) {
+        $slotId = (int)$row['id'];
+        try {
+            $pdo->beginTransaction();
+
+            $lock = $pdo->prepare(
+                'SELECT id, exam_date, slot_time, end_time, room_label, capacity, filled
+                   FROM exam_slot_schedule
+                  WHERE id = ?
+                  FOR UPDATE'
+            );
+            $lock->execute([$slotId]);
+            $slot = $lock->fetch();
+            if (!$slot
+                || (int)$slot['filled'] >= (int)$slot['capacity']
+                || (string)$slot['exam_date'] < $today
+                || ((string)$slot['exam_date'] === $today
+                    && !empty($slot['slot_time'])
+                    && (string)$slot['slot_time'] <= $nowTime)) {
+                $pdo->rollBack();
+                continue;
+            }
+
+            // Defensive: re-check the applicant hasn't been assigned
+            // between our pre-check and this point.
+            $dupe = $pdo->prepare(
+                'SELECT id FROM applicant_exam_slots WHERE applicant_id = ? FOR UPDATE'
+            );
+            $dupe->execute([$applicantId]);
+            if ($dupe->fetch()) {
+                $pdo->rollBack();
+                return null;
+            }
+
+            $pdo->prepare(
+                'INSERT INTO applicant_exam_slots (applicant_id, slot_id) VALUES (?, ?)'
+            )->execute([$applicantId, $slotId]);
+
+            $pdo->prepare(
+                'UPDATE exam_slot_schedule SET filled = filled + 1 WHERE id = ?'
+            )->execute([$slotId]);
+
+            $pdo->commit();
+
+            // ── post-commit notifications (best-effort) ──────────
+            $dateStr = date('F j, Y', strtotime((string)$slot['exam_date']));
+            $timeStr = !empty($slot['slot_time'])
+                     ? date('g:i A', strtotime((string)$slot['slot_time']))
+                     : '';
+            $room    = (string)($slot['room_label'] ?? '');
+
+            try {
+                $uStmt = $pdo->prepare('SELECT user_id FROM applicants WHERE id = ?');
+                $uStmt->execute([$applicantId]);
+                $userId = (int)$uStmt->fetchColumn();
+                if ($userId > 0) {
+                    create_notification(
+                        $userId,
+                        'exam_slot_assigned',
+                        'Exam Slot Assigned',
+                        trim("You have been assigned to take the exam on {$dateStr}"
+                            . ($timeStr ? " at {$timeStr}" : '')
+                            . ($room    ? " in {$room}"    : '')
+                            . '.'),
+                        '/student/exam'
+                    );
+                }
+            } catch (\Throwable $e) {
+                error_log('exam slot assigned notification failed: ' . $e->getMessage());
+            }
+
+            audit_log(
+                'exam_slot_auto_assigned',
+                "Auto-assigned applicant {$applicantId} to slot {$slotId}",
+                'applicant',
+                $applicantId
+            );
+            return $slotId;
+        } catch (\Throwable $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            error_log('Auto-assign exam slot error: ' . $e->getMessage());
+            // Continue to next candidate on transient errors.
+            continue;
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Backfill exam-slot assignments for every applicant who is at the
+ * exam stage but has no slot row yet. Safe to call multiple times.
+ *
+ * Use cases:
+ *   - When a new exam slot is created (a waiting applicant who
+ *     matches its department / capacity is picked up immediately).
+ *   - As a safety-net after bulk advance-to-exam.
+ *
+ * Returns the number of applicants who actually got assigned.
+ */
+function backfill_exam_slot_assignments(): int
+{
+    $pdo = db();
+    $assigned = 0;
+    try {
+        $stmt = $pdo->query(
+            'SELECT a.id
+               FROM applicants a
+          LEFT JOIN applicant_exam_slots aes ON aes.applicant_id = a.id
+              WHERE a.overall_status = "exam"
+                AND aes.id IS NULL
+              ORDER BY a.documents_approved_at ASC, a.id ASC'
+        );
+        $waiting = $stmt->fetchAll();
+    } catch (\Throwable $e) {
+        error_log('backfill_exam_slot_assignments query failed: ' . $e->getMessage());
+        return 0;
+    }
+    foreach ($waiting as $r) {
+        $newSlot = auto_assign_exam_slot((int)$r['id']);
+        if ($newSlot !== null) $assigned++;
+    }
+    return $assigned;
+}
+
+/**
+ * Symmetric helper for the interview side. Scans for every applicant
+ * sitting at the interview stage with no active interview_queue row
+ * and tries to assign each one. Safe to call multiple times.
+ *
+ * Use cases:
+ *   - As a safety-net after staff bulk actions, when the student
+ *     refreshes /student/interview without a slot, or any place the
+ *     applicant has been advanced to interview stage without being
+ *     paired with a slot yet.
+ *
+ * Unlike bulk_assign_pending_applicants() (which bails on the first
+ * applicant who can't be assigned, since it's normally used right
+ * after one specific department's slot was created), this one walks
+ * the full waiting list and keeps going — different applicants may
+ * have different department matches.
+ *
+ * Returns the number of applicants who actually got assigned.
+ */
+function backfill_interview_slot_assignments(?int $actorUserId = null): int
+{
+    if (!function_exists('assign_interview_slot')) {
+        return 0;
+    }
+    $pdo = db();
+    try {
+        $stmt = $pdo->query(
+            'SELECT a.id
+               FROM applicants a
+          LEFT JOIN interview_queue q ON q.applicant_id = a.id
+                                   AND q.interview_status IN ("pending","completed")
+              WHERE a.overall_status = "interview"
+                AND q.id IS NULL
+              ORDER BY a.id ASC'
+        );
+        $waiting = array_map('intval', $stmt->fetchAll(\PDO::FETCH_COLUMN) ?: []);
+    } catch (\Throwable $e) {
+        error_log('backfill_interview_slot_assignments query failed: ' . $e->getMessage());
+        return 0;
+    }
+    $assigned = 0;
+    foreach ($waiting as $aid) {
+        try {
+            if (assign_interview_slot($aid, $actorUserId)) {
+                $assigned++;
+            }
+        } catch (\Throwable $e) {
+            error_log("backfill_interview_slot_assignments: applicant #{$aid} failed — " . $e->getMessage());
+        }
+    }
+    return $assigned;
 }
 
 // ----------------------------------------------------------------
@@ -540,7 +531,7 @@ function auto_release_results(): array
         $examPassed   = isset($appl['exam_passed']) ? (int) $appl['exam_passed'] : -1;
         $interviewRes = $appl['evaluation_result'];
 
-        if ($examPassed === 0 || $interviewRes === 'fail') {
+        if ($examPassed === 0 || $interviewRes === 'reject') {
             $decision = 'rejected';
         } elseif ($examPassed === 1 && $interviewRes === 'pass') {
             $decision = 'accepted';
@@ -561,13 +552,13 @@ function auto_release_results(): array
         $pdo->prepare('UPDATE applicants SET overall_status = "released" WHERE id = ?')
             ->execute([(int) $appl['applicant_id']]);
 
-        notify_stage_transition((int) $appl['applicant_id'], 'released', 'Result: ' . ucfirst($decision));
+        notify_stage_transition((int) $appl['applicant_id'], 'released', 'Result: ' . (RESULT_LABELS[$decision] ?? ucfirst($decision)));
         $counts[$decision]++;
     }
 
     if (array_sum($counts) > 0) {
         audit_log('auto_release_results',
-            "Auto-released results: {$counts['accepted']} accepted, {$counts['rejected']} rejected");
+            "Auto-released results: {$counts['accepted']} accepted, {$counts['rejected']} declined");
     }
 
     return $counts;
@@ -725,29 +716,6 @@ function ensure_notifications_table(): void
             PRIMARY KEY (`id`),
             KEY `idx_notif_user` (`user_id`, `is_read`),
             KEY `idx_notif_created` (`created_at`)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
-    }
-}
-
-function ensure_document_validations_table(): void
-{
-    static $checked = false;
-    if ($checked) return;
-    $checked = true;
-
-    try {
-        db()->query('SELECT 1 FROM document_validations LIMIT 0');
-    } catch (\Throwable) {
-        db()->exec('CREATE TABLE IF NOT EXISTS `document_validations` (
-            `id` BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
-            `document_id` INT(10) UNSIGNED NOT NULL,
-            `validation_type` ENUM("ocr","ai","file_check") NOT NULL DEFAULT "file_check",
-            `status` ENUM("passed","failed","uncertain") NOT NULL,
-            `confidence` DECIMAL(5,2) DEFAULT NULL,
-            `details` TEXT DEFAULT NULL,
-            `validated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (`id`),
-            KEY `idx_dv_document` (`document_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
     }
 }
@@ -1079,10 +1047,126 @@ function ensure_reschedule_requests_table(): void
             `status` ENUM("pending","approved","denied") NOT NULL DEFAULT "pending",
             `reviewed_by` INT(10) UNSIGNED DEFAULT NULL,
             `reviewed_at` DATETIME DEFAULT NULL,
+            `deny_reason` TEXT DEFAULT NULL,
             `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (`id`),
             KEY `idx_rr_applicant` (`applicant_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+    }
+    // Add deny_reason on existing installs without a manual migration.
+    try {
+        db()->query('SELECT deny_reason FROM reschedule_requests LIMIT 0');
+    } catch (\Throwable) {
+        try {
+            db()->exec('ALTER TABLE `reschedule_requests` ADD COLUMN `deny_reason` TEXT NULL AFTER `reviewed_at`');
+        } catch (\Throwable) {}
+    }
+}
+
+// ----------------------------------------------------------------
+// EXAM RESCHEDULE REQUESTS
+// ----------------------------------------------------------------
+//
+// Mirror of reschedule_requests but for exam slots. Created on-demand
+// the first time a student submits an exam-reschedule request, so
+// existing installs don't need a manual migration.
+//
+function ensure_exam_reschedule_requests_table(): void
+{
+    static $checked = false;
+    if ($checked) return;
+    $checked = true;
+    try {
+        db()->query('SELECT 1 FROM exam_reschedule_requests LIMIT 0');
+    } catch (\Throwable) {
+        db()->exec('CREATE TABLE IF NOT EXISTS `exam_reschedule_requests` (
+            `id` BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+            `applicant_id` INT(10) UNSIGNED NOT NULL,
+            `slot_id` INT(10) UNSIGNED NOT NULL,
+            `reason` TEXT NOT NULL,
+            `status` ENUM("pending","approved","denied") NOT NULL DEFAULT "pending",
+            `reviewed_by` INT(10) UNSIGNED DEFAULT NULL,
+            `reviewed_at` DATETIME DEFAULT NULL,
+            `deny_reason` TEXT DEFAULT NULL,
+            `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_err_applicant` (`applicant_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci');
+    }
+    // Add deny_reason on existing installs without a manual migration.
+    try {
+        db()->query('SELECT deny_reason FROM exam_reschedule_requests LIMIT 0');
+    } catch (\Throwable) {
+        try {
+            db()->exec('ALTER TABLE `exam_reschedule_requests` ADD COLUMN `deny_reason` TEXT NULL AFTER `reviewed_at`');
+        } catch (\Throwable) {}
+    }
+}
+
+// ----------------------------------------------------------------
+// RESCHEDULE: shared decision notification (in-app + email)
+// ----------------------------------------------------------------
+
+/**
+ * In-app notification + branded email letting a student know their
+ * reschedule request was approved or denied. Used by both the
+ * interview and exam approve/deny handlers.
+ *
+ * $kind     = 'interview' | 'exam'
+ * $decision = 'approved'  | 'denied'
+ * $extra    = optional details ("new slot: Mon Jan 5, 9 AM, Rm 201"
+ *             on approve; "reason: scheduling conflict" on deny)
+ */
+function notify_reschedule_decision(
+    int $applicantId,
+    string $kind,
+    string $decision,
+    string $extra = ''
+): void {
+    $kind     = $kind === 'exam' ? 'exam' : 'interview';
+    $decision = $decision === 'approved' ? 'approved' : 'denied';
+
+    try {
+        $stmt = db()->prepare(
+            'SELECT u.id AS user_id, u.email, u.name
+               FROM applicants a
+               JOIN users u ON u.id = a.user_id
+              WHERE a.id = ?
+              LIMIT 1'
+        );
+        $stmt->execute([$applicantId]);
+        $user = $stmt->fetch();
+        if (!$user) return;
+
+        $link = $kind === 'exam' ? '/student/exam' : '/student/interview';
+
+        if ($decision === 'approved') {
+            $title = 'Reschedule approved';
+            $msg   = ucfirst($kind) . " reschedule approved."
+                   . ($extra ? ' ' . $extra : '');
+        } else {
+            $title = 'Reschedule request denied';
+            $msg   = "Your {$kind} reschedule request was not approved."
+                   . ($extra ? ' ' . $extra : '');
+        }
+
+        create_notification((int)$user['user_id'], 'reschedule_' . $decision, $title, $msg, $link);
+
+        if (!empty($user['email'])) {
+            $fullLink  = rtrim(BASE_URL, '/') . $link;
+            $emailBody = '<p>' . e($msg) . '</p>'
+                       . '<p style="margin-top:16px"><a href="' . e($fullLink) . '" '
+                       . 'style="display:inline-block;padding:10px 24px;background:' . e(school_setting('accent_color', '#2d6a4f')) . ';color:#fff;'
+                       . 'text-decoration:none;border-radius:6px;font-weight:bold">View Details</a></p>';
+            send_email(
+                (string)$user['email'],
+                $title . ' — ' . school_setting('school_name', 'PLP Admissions'),
+                email_template($title, $emailBody),
+                (string)$user['name']
+            );
+        }
+    } catch (\Throwable $e) {
+        error_log('reschedule decision notify failed: ' . $e->getMessage());
     }
 }
 
@@ -1163,19 +1247,16 @@ function notify_staff_results_pending(int $count): void
 
 /**
  * Auto-reschedule a no-show applicant to the next available interview slot.
- * Called from record_interview_evaluation() when absent=true and from
- * the live-queue auto-sweep when a slot expires without the applicant
- * showing up.
+ * Called from record_interview_evaluation() when absent=true, from the
+ * mark_no_show staff action, and from the dashboard "Reschedule absent
+ * students" button.
  *
- * Steps:
- *   1. Flip the existing queue row to interview_status='absent' (the
- *      valid ENUM value — note that 'no_show' is NOT a member of the
- *      interview_status ENUM and would silently fail to update).
- *   2. Keep the applicant in 'interview' overall_status so the
- *      bulk-assign filter picks them up.
- *   3. Call reschedule_absent_applicant() which logs to reschedule_logs,
- *      deletes the old absent row (UNIQUE INDEX on applicant_id requires
- *      this), and books a fresh slot via assign_interview_slot().
+ * Expects the applicant's queue row to already be in the canonical
+ * absent state (interview_status='absent'). When called from
+ * record_interview_evaluation / mark_no_show / auto_detect_interview_no_shows
+ * that is already true. If called against a still-pending row, this
+ * routine also flips it to 'absent' first so the rescheduler has a
+ * consistent starting point.
  */
 function auto_reschedule_noshow(int $applicantId, ?int $actorUserId = null): ?int
 {
@@ -1183,16 +1264,15 @@ function auto_reschedule_noshow(int $applicantId, ?int $actorUserId = null): ?in
 
     $pdo = db();
 
-    // Mark the existing queue row absent (covers manual mark-no-show
-    // where the row is still status='in_progress' or 'scheduled' AND
-    // interview_status='pending'). The live-queue auto-sweep already
-    // does this, but this call must be idempotent so it's safe to run
-    // either way.
+    // If somehow the row is still 'pending', normalise it to the
+    // canonical absent state. This is a no-op when the caller (mark_no_show,
+    // record_interview_evaluation, auto_detect_interview_no_shows) already
+    // did it.
     $pdo->prepare(
         'UPDATE interview_queue
-            SET interview_status = "absent",
+            SET status            = "no_show",
+                interview_status  = "absent",
                 attendance_status = "absent",
-                status            = "no_show",
                 evaluated_at      = COALESCE(evaluated_at, NOW())
           WHERE applicant_id = ?
             AND interview_status = "pending"'
@@ -1203,11 +1283,17 @@ function auto_reschedule_noshow(int $applicantId, ?int $actorUserId = null): ?in
         'UPDATE applicants SET overall_status = "interview" WHERE id = ? AND overall_status IN ("interview","result")'
     )->execute([$applicantId]);
 
-    // Reschedule via the absent-applicant path. This logs reschedule_logs,
-    // deletes the old absent row (required for the UNIQUE INDEX on
-    // applicant_id), and books the next available slot.
+    // Try to reschedule via the absent-aware path (which deletes the
+    // absent row and asks the scheduler for a new one). Fall back to
+    // the generic rescheduler for legacy rows that aren't yet absent.
     try {
-        $newSlotId = reschedule_absent_applicant($applicantId, null, $actorUserId ?? 0);
+        $newSlotId = null;
+        if (function_exists('reschedule_absent_applicant')) {
+            $newSlotId = reschedule_absent_applicant($applicantId, null, $actorUserId ?? 0);
+        }
+        if (!$newSlotId && function_exists('reschedule_interview')) {
+            $newSlotId = reschedule_interview($applicantId, $actorUserId);
+        }
         if ($newSlotId) {
             // Notify the student
             $stmt = $pdo->prepare('SELECT user_id FROM applicants WHERE id = ?');
@@ -1381,21 +1467,26 @@ function auto_close_expired_sessions(): int
     $expired = $stmt->fetchAll();
 
     foreach ($expired as $slot) {
+        // Mark remaining unevaluated applicants as absent (canonical
+        // no-show state used by record_interview_evaluation). The
+        // dedicated helper sets status='no_show',
+        // interview_status='absent', attendance_status='absent' and
+        // notifies each student.
+        $noShows = 0;
+        if (function_exists('auto_detect_interview_no_shows')) {
+            try {
+                $noShows = auto_detect_interview_no_shows((int)$slot['id']);
+            } catch (\Throwable $e) {
+                error_log('auto_detect_interview_no_shows on slot ' . $slot['id'] . ' failed: ' . $e->getMessage());
+            }
+        }
+
         // Close the slot
         $pdo->prepare('UPDATE interview_slots SET status = "closed" WHERE id = ?')
             ->execute([$slot['id']]);
 
-        // Mark remaining "scheduled" applicants as no-shows
-        $pdo->prepare(
-            'UPDATE interview_queue
-             SET status = "no_show", interview_status = "no_show"
-             WHERE slot_id = ? AND status = "scheduled" AND interview_status = "pending"'
-        )->execute([$slot['id']]);
-
-        $noShows = (int)($pdo->query('SELECT ROW_COUNT()')->fetchColumn() ?: 0);
-
         audit_log('auto_close_session',
-            "Auto-closed expired session #{$slot['id']} ({$slot['slot_date']}). {$noShows} marked as no-show.",
+            "Auto-closed expired session #{$slot['id']} ({$slot['slot_date']}). {$noShows} marked as absent.",
             'interview_slot', $slot['id']);
 
         $closed++;

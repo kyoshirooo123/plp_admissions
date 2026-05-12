@@ -20,9 +20,11 @@ $isStudent    = ($userRole === 'student');
 <?php
 // CSP header
 // CSP — `connect-src` is intentionally permissive (any HTTPS host) because
-// Puter's "AI Validate" feature uploads via signed PUT URLs that point at
-// object-storage hosts (S3 / R2 / *.puter.site / *.amazonaws.com) returned
-// at runtime. A strict allow-list breaks every time Puter changes infra.
+// the exam builder's Puter AI integration uploads via signed PUT URLs that
+// point at object-storage hosts (S3 / R2 / *.puter.site / *.amazonaws.com)
+// returned at runtime. A strict allow-list breaks every time Puter changes
+// infra. (The old documents AI Validate feature has been removed; Puter is
+// only used by the exam builder now.)
 header("Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline' https://js.hcaptcha.com https://*.hcaptcha.com https://cdnjs.cloudflare.com https://js.puter.com; worker-src 'self' blob: https://cdnjs.cloudflare.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob: https:; frame-src https://newassets.hcaptcha.com https://*.hcaptcha.com https://*.puter.com; connect-src 'self' https: blob: data:;");
 header("X-Content-Type-Options: nosniff");
 header("X-Frame-Options: SAMEORIGIN");
@@ -472,7 +474,7 @@ header("Referrer-Policy: strict-origin-when-cross-origin");
                 <div>
                     <label class="form-label">Type <strong>Withdraw</strong> to confirm</label>
                     <input type="text" id="withdraw-confirm-input" class="form-control"
-                           placeholder="Withdraw" autocomplete="off" style="max-width:220px"
+                           placeholder="Withdraw" autocomplete="off" style="max-width:220px;text-transform:none"
                            oninput="document.getElementById('withdraw-submit-btn').disabled = this.value.trim().toLowerCase() !== 'withdraw'">
                 </div>
                 <div>
@@ -495,6 +497,20 @@ document.getElementById('withdraw-modal').addEventListener('click', function(e) 
 });
 </script>
 <?php endif; ?>
+
+<script>
+// Global Escape-to-close for any open modal. Modals across the app
+// use the same .modal-backdrop wrapper toggled via inline display:
+// this listens once at the document level so every modal benefits
+// without per-page wiring.
+document.addEventListener('keydown', function(e) {
+    if (e.key !== 'Escape') return;
+    document.querySelectorAll('.modal-backdrop').forEach(function(m) {
+        var visible = m.style.display && m.style.display !== 'none';
+        if (visible) m.style.display = 'none';
+    });
+});
+</script>
 
 </body>
 </html>

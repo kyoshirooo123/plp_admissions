@@ -98,7 +98,7 @@ ob_start();
         </div>
 
         <p style="font-size:var(--text-sm);color:var(--text-tertiary)">
-            If you believe this was done in error, please visit the admissions office in person to discuss your options.
+            If you think this is a mistake, visit the admissions office in person.
         </p>
     </div>
 
@@ -109,7 +109,7 @@ ob_start();
             <path stroke="currentColor" stroke-width="1.5" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
         </svg>
         <p style="font-weight:var(--weight-medium)">Result not yet released</p>
-        <p style="font-size:var(--text-sm);margin-top:4px">Your admission result has not been released yet. You will be notified once it is ready.</p>
+        <p style="font-size:var(--text-sm);margin-top:4px">You'll be notified once your result is ready.</p>
     </div>
 
 <?php else:
@@ -154,70 +154,11 @@ ob_start();
             <?php endif; ?>
         </div>
 
-        <?php if ($result['result'] === 'accepted' && ($result['enrollment_intent'] ?? '') !== 'confirmed' && !$isWithdrawn): ?>
-        <!-- Enrollment Confirmation -->
-        <div class="card" style="padding:var(--space-5);margin-bottom:var(--space-5);border:1.5px solid var(--success);background:var(--success-bg)">
-            <div style="display:flex;align-items:center;gap:var(--space-3);margin-bottom:var(--space-3)">
-                <?= icon('ic_fluent_checkmark_circle_24_regular', 24, 'color:var(--success)') ?>
-                <div>
-                    <div style="font-weight:var(--weight-semibold);font-size:var(--text-sm)">Confirm Your Enrollment</div>
-                    <div style="font-size:var(--text-xs);color:var(--text-secondary)">Click below to confirm that you intend to enroll at PLP.</div>
-                </div>
-            </div>
-            <form method="POST" action="<?= url('/student/result') ?>" onsubmit="return confirm('Are you sure you want to confirm your enrollment?')">
-                <?= csrf_field() ?>
-                <input type="hidden" name="action" value="confirm_enrollment">
-                <button type="submit" class="btn btn-primary" style="width:100%">I Confirm My Enrollment</button>
-            </form>
-        </div>
-        <?php elseif ($result['result'] === 'accepted' && ($result['enrollment_intent'] ?? '') === 'confirmed'): ?>
-        <div class="alert alert-success" style="margin-bottom:var(--space-5)">
-            <?= icon('ic_fluent_checkmark_circle_24_regular', 16) ?>
-            You have confirmed your enrollment. Welcome to PLP!
-        </div>
-        <?php endif; ?>
-
-        <!-- Exam score breakdown -->
-        <?php if ($_examResult): ?>
-        <?php
-            $eRank   = $_examResult['rank_score'] > 0 ? (int)$_examResult['rank_score']
-                       : score_to_rank((int)$_examResult['score'], (int)($_examResult['total_items'] ?: 1));
-            $eTier   = rank_tier_info($eRank);
-            $ePassed = $_examResult['passed'] !== null ? (bool)$_examResult['passed']
-                       : exam_passed((int)$_examResult['score'], (int)($_examResult['total_items'] ?: 1), $applicant['course_applied']);
-            $ePct    = $_examResult['total_items'] > 0 ? round(($_examResult['score'] / $_examResult['total_items']) * 100) : 0;
-        ?>
-        <div style="background:var(--bg-subtle);border-radius:var(--radius-md);padding:var(--space-5);margin-bottom:var(--space-5)">
-            <div style="font-size:var(--text-xs);text-transform:uppercase;letter-spacing:.06em;color:var(--text-tertiary);margin-bottom:var(--space-3)">Entrance Exam Result</div>
-            <div style="display:flex;align-items:center;gap:var(--space-4);flex-wrap:wrap">
-                <div style="width:56px;height:56px;border-radius:50%;
-                            background:<?= $eTier['bg'] ?>;border:2px solid <?= $eTier['color'] ?>;
-                            display:flex;flex-direction:column;align-items:center;justify-content:center;flex-shrink:0">
-                    <span style="font-size:1.3rem;font-weight:var(--weight-semibold);color:<?= $eTier['color'] ?>;line-height:1"><?= $eRank ?></span>
-                    <span style="font-size:9px;color:<?= $eTier['color'] ?>">/10</span>
-                </div>
-                <div style="flex:1">
-                    <div style="display:flex;align-items:center;gap:var(--space-2);margin-bottom:4px;flex-wrap:wrap">
-                        <span style="font-weight:var(--weight-semibold);font-size:var(--text-sm)">
-                            <?= (int)$_examResult['score'] ?> / <?= (int)$_examResult['total_items'] ?> &nbsp;(<?= $ePct ?>%)
-                        </span>
-                        <span style="font-size:var(--text-xs);font-weight:var(--weight-semibold);color:<?= $eTier['color'] ?>">
-                            <?= $eTier['label'] ?> Tier
-                        </span>
-                        <?php if ($ePassed): ?>
-                            <span style="font-size:var(--text-xs);color:var(--success);font-weight:var(--weight-semibold)"><?= icon('ic_fluent_checkmark_24_regular', 12) ?> Passed</span>
-                        <?php else: ?>
-                            <span style="font-size:var(--text-xs);color:var(--error);font-weight:var(--weight-semibold)"><?= icon('ic_fluent_dismiss_24_regular', 12) ?> Did not pass</span>
-                        <?php endif; ?>
-                    </div>
-                    <div style="font-size:var(--text-xs);color:var(--text-tertiary)">
-                        Course: <?= e($applicant['course_applied']) ?> &nbsp;·&nbsp;
-                        Passing rank: ≥ <?= get_pass_threshold($applicant['course_applied']) ?>
-                    </div>
-                </div>
-            </div>
-        </div>
-        <?php endif; ?>
+        <!-- Exam score breakdown removed from the result page.
+             Students already see their full score / rank / tier on
+             /student/exam right after submitting; repeating it here
+             reads like a post-mortem (especially when rejected) and
+             distracts from the actual decision. -->
 
         <!-- Course suggestion from staff -->
         <?php if ($suggestion && $suggestion['status'] === 'pending'): ?>
@@ -229,7 +170,7 @@ ob_start();
                 <div style="flex:1">
                     <div style="font-weight:var(--weight-semibold);font-size:var(--text-sm);margin-bottom:4px">Course Suggestion from Admissions</div>
                     <p style="font-size:var(--text-sm);color:var(--text-secondary);margin-bottom:var(--space-3)">
-                        The admissions office has suggested an alternative course based on your exam results:
+                        Admissions suggested an alternative course:
                     </p>
                     <div style="background:white;border:1px solid #fde68a;border-radius:var(--radius-md);padding:var(--space-3) var(--space-4);font-weight:var(--weight-semibold);font-size:var(--text-sm);margin-bottom:var(--space-3)">
                         <?= e($suggestion['suggested_course']) ?>
@@ -240,7 +181,7 @@ ob_start();
                     </p>
                     <?php endif; ?>
                     <p style="font-size:var(--text-xs);color:var(--text-tertiary)">
-                        Please visit the admissions office to discuss this recommendation and update your application if you wish to proceed.
+                        Visit the admissions office to discuss and update your application.
                     </p>
                 </div>
             </div>
@@ -300,9 +241,7 @@ ob_start();
                         <?php endforeach; ?>
                     </ul>
                     <div style="background:#e0e7ff;border-radius:var(--radius-sm);padding:var(--space-3);font-size:var(--text-xs);color:#3730a3">
-                        <strong>What to do next:</strong> Visit the admissions office and let them know you're interested in
-                        exploring one of the programs above. They'll be happy to walk you through the transfer process — no
-                        need to re-take the exam for these courses.
+                        <strong>What to do next:</strong> Visit the admissions office to apply for one of these programs — no re-exam needed.
                     </div>
                 </div>
             </div>
@@ -312,9 +251,8 @@ ob_start();
         <div style="border:1px solid var(--border);background:var(--bg-subtle);border-radius:var(--radius-md);
                     padding:var(--space-4);margin-bottom:var(--space-5)">
             <p style="font-size:var(--text-sm);color:var(--text-secondary);margin:0">
-                We understand this isn't the news you were hoping for, and we truly appreciate the effort you put in.
-                While there are no qualifying alternatives available based on your current strand and score, we
-                encourage you to visit the admissions office — they can advise you on options for the next admission cycle.
+                We understand this isn't the news you hoped for. There are no qualifying alternatives for your strand and
+                score this cycle. Visit the admissions office to discuss options for the next admission cycle.
             </p>
         </div>
         <?php endif; ?>

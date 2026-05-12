@@ -13,6 +13,8 @@ $db     = db();
 $id     = (int)($_GET['id'] ?? 0);
 $action = $_POST['action'] ?? '';
 $staffId = Auth::id();
+$isAjax = !empty($_SERVER['HTTP_X_REQUESTED_WITH'])
+    && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest';
 
 switch ($action) {
 
@@ -84,7 +86,41 @@ switch ($action) {
         }
 
         audit_log('documents_approved_all', "Approved all {$affected} document(s) for applicant {$id}", 'applicant', $id);
-        Session::flash('success', "{$affected} document" . ($affected != 1 ? 's' : '') . " approved.");
+        $msg = "{$affected} document" . ($affected != 1 ? 's' : '') . " approved.";
+
+        if ($isAjax) {
+            header('Content-Type: application/json');
+            echo json_encode(['ok' => true, 'message' => $msg, 'affected' => $affected]);
+            exit;
+        }
+        Session::flash('success', $msg);
+        redirect('/staff/applicants/' . $id);
+        break;
+
+    case 'undo_approve_all':
+        // Revert all docs that were just approved back to uploaded
+        $stmt = $db->prepare(
+            'UPDATE documents SET status="uploaded", staff_remarks=NULL, reviewed_by=NULL
+              WHERE applicant_id=? AND status="approved"'
+        );
+        $stmt->execute([$id]);
+        $reverted = $stmt->rowCount();
+
+        // Roll back applicant status if it was auto-advanced
+        $db->prepare(
+            'UPDATE applicants SET overall_status="submitted", documents_approved_at=NULL
+              WHERE id=? AND overall_status="exam"'
+        )->execute([$id]);
+
+        audit_log('undo_approve_all', "Undid bulk approval for applicant {$id} ({$reverted} docs reverted)", 'applicant', $id);
+        $msg = "Reverted {$reverted} document" . ($reverted != 1 ? 's' : '') . ".";
+
+        if ($isAjax) {
+            header('Content-Type: application/json');
+            echo json_encode(['ok' => true, 'message' => $msg]);
+            exit;
+        }
+        Session::flash('success', $msg);
         redirect('/staff/applicants/' . $id);
         break;
 
@@ -155,6 +191,13 @@ switch ($action) {
                 AND overall_status IN ("pending","documents")'
         );
         $stmt->execute([$id]);
+
+        // Manual advance must run the same automation hooks as the
+        // approve-all path — otherwise the student lands on /student/exam
+        // with no slot until a different code path heals it.
+        notify_stage_transition($id, 'exam');
+        auto_assign_exam_slot($id);
+
         audit_log('applicant_advanced_exam', "Manually advanced applicant {$id} to exam stage", 'applicant', $id);
         Session::flash('success', 'Applicant advanced to exam stage.');
         redirect('/staff/applicants/' . $id);

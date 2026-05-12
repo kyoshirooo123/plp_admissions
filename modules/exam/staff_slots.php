@@ -214,7 +214,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // Dean and Proctor reach this page in read-only mode — if any
     // other action posts through, reject it.
     if (!$canManage) {
-        Session::flash('error', 'Read-only access — only SSO and Admin can modify exam slots.');
+        Session::flash('error', 'Read-only — only SSO and Admin can modify exam slots.');
         _slots_redirect_back($ctxCollege, $ctxSlotId);
     }
 
@@ -235,27 +235,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if ($action === 'add_slot') {
         $date     = trim($_POST['exam_date']  ?? '');
         $time     = trim($_POST['slot_time']  ?? '08:00');
+        $endTime  = trim($_POST['end_time']   ?? '');
         $room     = trim($_POST['room_label'] ?? '');
         $capacity = (int)($_POST['capacity']  ?? 35);
         $slotDept = $canManage
             ? trim($_POST['department'] ?? '')
             : user_department($staffId);
 
+        // Default close time = opens + 90 minutes if the form didn't
+        // supply one (older form variants, JS off, etc).
+        if ($endTime === '') {
+            $endTime = date('H:i', strtotime($time . ' +90 minutes'));
+        }
+
         if (!$date)              $errors[] = 'Exam date is required.';
         if (!$room)              $errors[] = 'Room label is required.';
         if (!$slotDept)          $errors[] = 'College / Department is required.';
         if ($capacity < 1)       $errors[] = 'Capacity must be at least 1.';
         if ($capacity > 500)     $errors[] = 'Capacity above 500 is unrealistic.';
+        if (strtotime($endTime) <= strtotime($time)) {
+            $errors[] = 'Close time must be after the start time.';
+        }
 
         if (!$errors) {
             $db->prepare(
                 'INSERT INTO exam_slot_schedule
-                    (exam_id, exam_date, slot_time, room_label, department, capacity, school_year, created_by)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-            )->execute([$activeExamId, $date, $time . ':00', $room, $slotDept, $capacity, $schoolYear, $staffId]);
+                    (exam_id, exam_date, slot_time, end_time, room_label, department, capacity, school_year, created_by)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
+            )->execute([$activeExamId, $date, $time . ':00', $endTime . ':00', $room, $slotDept, $capacity, $schoolYear, $staffId]);
             audit_log('exam_slot_added',
-                "Added slot: {$date} {$time} {$room} [{$slotDept}] (cap {$capacity})");
-            Session::flash('success', "Slot added: {$room} ({$slotDept}) on " . date('M j, Y', strtotime($date)) . " at {$time}.");
+                "Added slot: {$date} {$time}-{$endTime} {$room} [{$slotDept}] (cap {$capacity})");
+
+            // Backfill: any applicant who advanced to exam stage
+            // before this slot existed should now get auto-assigned.
+            // Without this, those students stay on the "Awaiting Slot
+            // Assignment" page until someone manually intervenes.
+            $assigned = 0;
+            if (function_exists('backfill_exam_slot_assignments')) {
+                $assigned = backfill_exam_slot_assignments();
+            }
+
+            Session::flash(
+                'success',
+                "Slot added: {$room} ({$slotDept}) on " . date('M j, Y', strtotime($date)) . " at {$time}-{$endTime}."
+                . ($assigned > 0 ? " Auto-assigned {$assigned} waiting applicant(s)." : '')
+            );
             _slots_redirect_back($slotDept ?: $ctxCollege);
         }
     }
@@ -265,11 +289,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $slotId   = (int)($_POST['slot_id']   ?? 0);
         $date     = trim($_POST['exam_date']  ?? '');
         $time     = trim($_POST['slot_time']  ?? '08:00');
+        $endTime  = trim($_POST['end_time']   ?? '');
         $room     = trim($_POST['room_label'] ?? '');
         $capacity = (int)($_POST['capacity']  ?? 35);
         $slotDept = $canManage
             ? trim($_POST['department'] ?? '')
             : user_department($staffId);
+
+        // Default close time = opens + 90 minutes if the form didn't
+        // supply one (older form variants, JS off, etc).
+        if ($endTime === '') {
+            $endTime = date('H:i', strtotime($time . ' +90 minutes'));
+        }
 
         if (!$slotId)          $errors[] = 'Invalid slot.';
         if (!$date)            $errors[] = 'Exam date is required.';
@@ -277,6 +308,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (!$slotDept)        $errors[] = 'College / Department is required.';
         if ($capacity < 1)     $errors[] = 'Capacity must be at least 1.';
         if ($capacity > 500)   $errors[] = 'Capacity above 500 is unrealistic.';
+        if (strtotime($endTime) <= strtotime($time)) {
+            $errors[] = 'Close time must be after the start time.';
+        }
 
         if (!$errors) {
             $stmt = $db->prepare('SELECT COUNT(*) FROM applicant_exam_slots WHERE slot_id=?');
@@ -287,11 +321,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             } else {
                 $db->prepare(
                     'UPDATE exam_slot_schedule
-                        SET exam_date=?, slot_time=?, room_label=?, department=?, capacity=?
+                        SET exam_date=?, slot_time=?, end_time=?, room_label=?, department=?, capacity=?
                       WHERE id=?'
-                )->execute([$date, $time . ':00', $room, $slotDept, $capacity, $slotId]);
+                )->execute([$date, $time . ':00', $endTime . ':00', $room, $slotDept, $capacity, $slotId]);
                 audit_log('exam_slot_edited',
-                    "Edited slot {$slotId}: {$date} {$time} {$room} [{$slotDept}] (cap {$capacity})");
+                    "Edited slot {$slotId}: {$date} {$time}-{$endTime} {$room} [{$slotDept}] (cap {$capacity})");
                 Session::flash('success', 'Slot updated.');
                 // If we were on the roster page, stay on it; otherwise return to the college grid.
                 if ($ctxSlotId > 0) {
@@ -512,7 +546,6 @@ $departments = departments_list();
 
 $slotsForCollege = [];
 $rosterBySlot    = [];
-$unassignedApplicants = [];
 $slotDetail      = null;
 $slotRoster      = [];
 
@@ -543,27 +576,6 @@ if ($mode === 'slots') {
     $stmt->execute([$schoolYear, $collegeParam]);
     $slotsForCollege = $stmt->fetchAll();
 
-    // Awaiting-slot applicants — only those whose course maps to this college,
-    // ordered FCFS by docs_approved_at.
-    $stmt = $db->prepare(
-        "SELECT a.id, a.course_applied, a.applicant_type, a.documents_approved_at,
-                u.name AS student_name,
-                u.first_name, u.middle_name, u.last_name, u.suffix
-           FROM applicants a
-           JOIN users u ON u.id = a.user_id
-      LEFT JOIN applicant_exam_slots aes ON aes.applicant_id = a.id
-          WHERE a.school_year   = ?
-            AND a.overall_status = 'exam'
-            AND aes.id IS NULL
-       ORDER BY a.course_applied ASC, a.documents_approved_at IS NULL,
-                a.documents_approved_at ASC, a.id ASC"
-    );
-    $stmt->execute([$schoolYear]);
-    foreach ($stmt->fetchAll() as $row) {
-        $applicantDept = course_to_department($row['course_applied']);
-        if ($applicantDept && $applicantDept !== $collegeParam) continue;
-        $unassignedApplicants[] = $row;
-    }
 }
 
 if ($mode === 'roster') {
@@ -963,10 +975,42 @@ ob_start();
     $today      = date('Y-m-d');
     $totalCap   = array_sum(array_column($slotsForCollege, 'capacity'));
     $totalFil   = array_sum(array_column($slotsForCollege, 'filled'));
+
+    // Build a date map for the toolbar filter dropdown. One entry per
+    // distinct exam date, with a count of slots on that date and a
+    // "past" flag for dates earlier than today. Filtering is pure
+    // client-side via data-date on each card — no extra DB queries.
+    $slotDateMap = [];
+    foreach ($slotsForCollege as $_s) {
+        $d = (string)($_s['exam_date'] ?? '');
+        if ($d === '') continue;
+        if (!isset($slotDateMap[$d])) {
+            $slotDateMap[$d] = ['date' => $d, 'count' => 0, 'is_past' => $d < $today];
+        }
+        $slotDateMap[$d]['count']++;
+    }
+    usort($slotDateMap, fn($a, $b) => $a['date'] <=> $b['date']);
     ?>
     <div style="display:flex;align-items:center;justify-content:center;gap:var(--space-3);
                 color:var(--text-tertiary);font-size:var(--text-xs);margin-bottom:var(--space-3);flex-wrap:wrap">
-        <span>
+        <?php if (count($slotDateMap) > 1): ?>
+            <select id="es-date-filter" class="form-control"
+                    title="Filter by exam date"
+                    style="height:32px;min-height:32px;font-size:var(--text-xs);max-width:280px;
+                           border:1px solid var(--border);border-radius:var(--radius-sm);
+                           padding:0 var(--space-2);background:var(--bg-elevated);color:var(--text-primary)">
+                <option value="" data-count="<?= count($slotsForCollege) ?>">
+                    All dates · <?= count($slotsForCollege) ?> slot<?= count($slotsForCollege) === 1 ? '' : 's' ?>
+                </option>
+                <?php foreach ($slotDateMap as $_d): ?>
+                    <option value="<?= e($_d['date']) ?>" data-count="<?= (int)$_d['count'] ?>">
+                        <?= format_date($_d['date']) ?><?= $_d['is_past'] ? ' (Past)' : '' ?>
+                        · <?= (int)$_d['count'] ?> slot<?= (int)$_d['count'] === 1 ? '' : 's' ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        <?php endif; ?>
+        <span id="es-slot-count">
             <?= count($slotsForCollege) ?> slot<?= count($slotsForCollege) === 1 ? '' : 's' ?>
             &nbsp;·&nbsp; <?= $totalFil ?> / <?= $totalCap ?> seats filled
         </span>
@@ -1009,6 +1053,9 @@ ob_start();
             <a href="<?= e(url('/staff/exam/slots') . '?slot=' . $sid) ?>"
                class="<?= $cardClass ?>"
                data-slot-id="<?= $sid ?>"
+               data-date="<?= e($slot['exam_date'] ?? '') ?>"
+               data-filled="<?= $filled ?>"
+               data-capacity="<?= $cap ?>"
                onclick="return onEsCardClick(event, this)">
                 <?php if ($canManage): ?>
                     <input type="checkbox" class="es-select-checkbox"
@@ -1132,77 +1179,7 @@ ob_start();
     </div>
     <?php endif; ?>
 
-    <!-- ── Awaiting-slot list, filtered to this college ─────────── -->
-    <?php if ($unassignedApplicants): ?>
-        <div class="card" style="padding:0;overflow:hidden;margin-top:var(--space-6)">
-            <div style="padding:var(--space-4) var(--space-5);border-bottom:1px solid var(--border);
-                        display:flex;justify-content:space-between;align-items:center">
-                <div>
-                    <div style="font-weight:var(--weight-semibold)">
-                        Awaiting Slot (<?= count($unassignedApplicants) ?>)
-                    </div>
-                    <div style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:2px">
-                        Documents approved · earliest-approved first.
-                    </div>
-                </div>
-            </div>
-            <table class="data-table" style="margin:0;width:100%">
-                <thead>
-                    <tr>
-                        <th>Applicant</th>
-                        <th>Course</th>
-                        <th>Type</th>
-                        <th>Approved</th>
-                        <th style="width:340px">Assign to Slot</th>
-                    </tr>
-                </thead>
-                <tbody>
-                <?php foreach ($unassignedApplicants as $u): ?>
-                    <tr>
-                        <td><?= e(format_full_name($u)) ?></td>
-                        <td style="font-size:var(--text-sm)"><?= e($u['course_applied']) ?></td>
-                        <td><span class="badge badge-neutral"><?= e(ucfirst($u['applicant_type'])) ?></span></td>
-                        <td style="font-size:var(--text-xs);color:var(--text-tertiary)">
-                            <?= $u['documents_approved_at']
-                                ? e(date('M j, g:i A', strtotime($u['documents_approved_at'])))
-                                : '<em>—</em>' ?>
-                        </td>
-                        <td>
-                            <?php if ($canManage): ?>
-                                <form method="POST"
-                                      style="display:flex;gap:var(--space-2);align-items:center;margin:0">
-                                    <?= csrf_field() ?>
-                                    <input type="hidden" name="action"        value="assign">
-                                    <input type="hidden" name="ctx_college"   value="<?= e($collegeParam) ?>">
-                                    <input type="hidden" name="applicant_id"  value="<?= (int)$u['id'] ?>">
-                                    <select name="slot_id" required class="form-input"
-                                            style="flex:1;font-size:var(--text-xs);padding:4px 8px">
-                                        <option value="">— Choose slot —</option>
-                                        <?php foreach ($slotsForCollege as $s):
-                                            if ((int)$s['filled'] >= (int)$s['capacity']) continue;
-                                            if ($s['exam_date'] < $today) continue;
-                                        ?>
-                                            <option value="<?= (int)$s['id'] ?>">
-                                                <?= e(format_date($s['exam_date'], 'M j')) ?>
-                                                · <?= e(format_time($s['slot_time'])) ?><?php if (!empty($s['end_time'])): ?>–<?= e(format_time($s['end_time'])) ?><?php endif; ?>
-                                                · <?= e($s['room_label']) ?>
-                                                (<?= (int)$s['filled'] ?>/<?= (int)$s['capacity'] ?>)
-                                            </option>
-                                        <?php endforeach; ?>
-                                    </select>
-                                    <button type="submit" class="btn btn-primary btn-sm"
-                                            style="font-size:var(--text-xs)">Assign</button>
-                                </form>
-                            <?php else: ?>
-                                <span style="font-size:var(--text-xs);color:var(--text-tertiary)">—</span>
-                            <?php endif; ?>
-                        </td>
-                    </tr>
-                <?php endforeach; ?>
-                </tbody>
-            </table>
-        </div>
-    <?php endif; ?>
+
 
 <?php elseif ($mode === 'roster'): ?>
 
@@ -1707,6 +1684,37 @@ ob_start();
     var m = document.getElementById(id);
     if (m) m.addEventListener('click', function (e) { if (e.target === this) this.style.display = 'none'; });
 });
+
+// ── Date filter on the slot card grid ────────────────────────
+// Mirrors the interview queue's date dropdown (see staff_queue.php).
+// Pure client-side: hide cards whose data-date doesn't match the
+// selected value, then rebuild the "N slots · X / Y seats filled"
+// summary line so the badge always reflects what's visible.
+(function() {
+    var dateEl  = document.getElementById('es-date-filter');
+    var countEl = document.getElementById('es-slot-count');
+    if (!dateEl) return;
+
+    function applyEsDateFilter() {
+        var picked  = dateEl.value;
+        var visible = 0, filled = 0, capacity = 0;
+        document.querySelectorAll('.es-slot-grid .es-slot-card').forEach(function(card) {
+            var d = card.getAttribute('data-date') || '';
+            var match = !picked || d === picked;
+            card.style.display = match ? '' : 'none';
+            if (match) {
+                visible++;
+                filled   += parseInt(card.getAttribute('data-filled')   || '0', 10);
+                capacity += parseInt(card.getAttribute('data-capacity') || '0', 10);
+            }
+        });
+        if (countEl) {
+            countEl.innerHTML = visible + ' slot' + (visible === 1 ? '' : 's')
+                + ' \u00a0\u00b7\u00a0 ' + filled + ' / ' + capacity + ' seats filled';
+        }
+    }
+    dateEl.addEventListener('change', applyEsDateFilter);
+})();
 
 // ── Bulk select mode for exam slot cards ─────────────────────
 function _esGrid()  { return document.querySelector('.es-slot-grid'); }

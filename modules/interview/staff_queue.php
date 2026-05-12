@@ -5,7 +5,7 @@
 // Live interview queue — single unified page that lists every
 // auto-assigned applicant. Each row exposes a single "Evaluation"
 // action that opens a modal where the interviewer records notes
-// plus a Pass / Fail decision.
+// plus a Pass / Reject decision.
 //
 // • Staff see every applicant assigned to a session they own
 //   (assigned_to with created_by fallback for legacy rows).
@@ -63,85 +63,6 @@ if ($canSeeAll && $collegeFilter === '') {
 }
 
 // ----------------------------------------------------------------
-// Date filter — slot-derived
-//
-// The queue used to show every slot_date in one list, which made it
-// impossible for a Professor running today's session to focus only on
-// the people actually walking in today. The dropdown is now built
-// from the distinct slot_dates that ACTUALLY have queue rows in the
-// caller's scope, so there are no dead options ("Past dates (0)")
-// and no surprises ("Today" empty when the session is tomorrow).
-//
-// `?date=` accepts either:
-//   YYYY-MM-DD — exact slot date (must be one of the dates the scope
-//                actually has rows for; otherwise we fall back to
-//                today if today is in the list, else "all")
-//   all        — no date filter
-//
-// Default: today if today is in the list, else the soonest upcoming
-// date in the list, else "all".
-// ----------------------------------------------------------------
-$availableDateScopeSql = '';
-$availableDateScopeParams = [];
-if ($canSeeAll && !$showAll) {
-    $availableDateScopeSql    = ' WHERE s.department = ?';
-    $availableDateScopeParams = [$collegeFilter];
-} elseif ($canSeeAll) {
-    $availableDateScopeSql    = '';
-    $availableDateScopeParams = [];
-} elseif ($isDean && $staffDept !== '') {
-    $availableDateScopeSql    = ' WHERE s.department = ?';
-    $availableDateScopeParams = [$staffDept];
-} else {
-    $availableDateScopeSql    = ' WHERE COALESCE(s.assigned_to, s.created_by) = ?';
-    $availableDateScopeParams = [$staffId];
-}
-$availableDatesStmt = $db->prepare(
-    'SELECT s.slot_date, COUNT(q.id) AS row_count
-       FROM interview_queue q
-       JOIN interview_slots s ON s.id = q.slot_id'
-    . $availableDateScopeSql .
-    ' GROUP BY s.slot_date
-      ORDER BY s.slot_date ASC'
-);
-$availableDatesStmt->execute($availableDateScopeParams);
-$availableDates = $availableDatesStmt->fetchAll();
-
-$availableDateMap = [];
-foreach ($availableDates as $d) {
-    $availableDateMap[(string)$d['slot_date']] = (int)$d['row_count'];
-}
-
-// Resolve requested filter against the list of dates we actually have.
-$dateFilterRaw = (string)($_GET['date'] ?? '');
-$dateFilter    = 'all';
-if ($dateFilterRaw === 'all') {
-    $dateFilter = 'all';
-} elseif ($dateFilterRaw !== '' && isset($availableDateMap[$dateFilterRaw])) {
-    $dateFilter = $dateFilterRaw;
-} else {
-    // No filter requested (or one that no longer applies) — default
-    // to today if it's in the list, else the soonest upcoming date,
-    // else "all".
-    if (isset($availableDateMap[$today])) {
-        $dateFilter = $today;
-    } else {
-        $futureDate = null;
-        foreach (array_keys($availableDateMap) as $d) {
-            if ($d >= $today) { $futureDate = $d; break; }
-        }
-        $dateFilter = $futureDate ?? 'all';
-    }
-}
-
-$dateWhereSql    = '';
-$dateWhereParams = [];
-if ($dateFilter !== 'all') {
-    $dateWhereSql      = ' AND s.slot_date = ?';
-    $dateWhereParams[] = $dateFilter;
-}
-
-// ----------------------------------------------------------------
 // Desk strip — find this interviewer's most-recent (or upcoming)
 // physical location so the staff sees where to send walk-ins. Purely
 // informational; it does NOT scope the table below. Only Professors
@@ -189,52 +110,35 @@ try { $db->query("SELECT evaluated_at FROM interview_queue LIMIT 0"); }
 catch (\Throwable $e) {
     $db->exec("ALTER TABLE interview_queue ADD COLUMN evaluated_at DATETIME DEFAULT NULL AFTER evaluation_result");
 }
+// Migrate 'fail' → 'reject' for existing data
+try {
+    $db->exec("UPDATE interview_queue SET evaluation_result='reject' WHERE evaluation_result='fail'");
+} catch (\Throwable $e) {}
 
 // ----------------------------------------------------------------
 // AUTO NO-SHOW
 // Flip any still-waiting / in-progress queue row whose slot has
-// already finished into status='no_show' AND interview_status='absent'.
-// This runs on every page load so the table always reflects reality
-// without anyone having to click a button.
+// already finished into the canonical absent state:
+//   status='no_show', interview_status='absent', attendance_status='absent'
+// This runs on every page load so the table — and the Absent
+// Students tab — always reflect reality without anyone having to
+// click a button. The previous inline UPDATE only set q.status,
+// which left absent_tab queries (WHERE q.interview_status='absent')
+// missing these rows.
 //
 // "Finished" means:
 //   • slot_date is before today, OR
 //   • slot_date is today AND end_time is set AND end_time <= NOW, OR
 //   • slot_date is today AND end_time is NULL AND slot_time is set
 //     AND the start time was more than an hour ago.
-//
-// Updating BOTH status and interview_status is intentional: the
-// pending-queue filter used by bulk_assign_pending_applicants()
-// excludes rows where interview_status IN ('pending','completed'),
-// so leaving interview_status at 'pending' would keep the no-show
-// applicant permanently locked out of auto-rebooking. Flipping to
-// 'absent' both surfaces them on /staff/interviews/absent and lets
-// the scheduler pick them up on the next slot creation.
 // ----------------------------------------------------------------
-try {
-    $autoNoShow = $db->prepare(
-        'UPDATE interview_queue q
-         JOIN   interview_slots s ON s.id = q.slot_id
-         SET    q.status           = "no_show",
-                q.interview_status = "absent",
-                q.attendance_status = "absent",
-                q.evaluated_at      = COALESCE(q.evaluated_at, NOW())
-         WHERE  q.status IN ("scheduled", "checked_in", "in_progress")
-           AND (
-                 s.slot_date < CURDATE()
-              OR (s.slot_date = CURDATE()
-                  AND s.end_time IS NOT NULL
-                  AND s.end_time <= CURTIME())
-              OR (s.slot_date = CURDATE()
-                  AND s.end_time IS NULL
-                  AND s.slot_time IS NOT NULL
-                  AND ADDTIME(s.slot_time, "01:00:00") <= CURTIME())
-           )'
-    );
-    $autoNoShow->execute();
-} catch (\Throwable $e) {
-    // Schema differences shouldn't block the page from rendering
-    error_log('auto-no-show update failed: ' . $e->getMessage());
+if (function_exists('auto_detect_interview_no_shows')) {
+    try {
+        auto_detect_interview_no_shows(null, Auth::id());
+    } catch (\Throwable $e) {
+        // Schema differences shouldn't block the page from rendering
+        error_log('auto-no-show update failed: ' . $e->getMessage());
+    }
 }
 
 // ----------------------------------------------------------------
@@ -259,16 +163,26 @@ $selectCols =
             u.last_name,
             u.suffix,
             u.email       AS student_email,
+            u.phone       AS student_phone,
+            u.birthdate   AS student_birthdate,
+            u.sex         AS student_sex,
+            u.address     AS student_address,
             u.department  AS student_department,
+            a.shs_strand,
+            a.school_year,
             s.id          AS slot_id,
             s.slot_date   AS slot_date,
             s.slot_time   AS slot_time,
             s.end_time    AS slot_end_time,
-            s.department  AS slot_department
+            s.department  AS slot_department,
+            er.score      AS exam_score,
+            er.total_items AS exam_total,
+            er.passed     AS exam_passed
      FROM   interview_queue q
      JOIN   interview_slots s ON s.id = q.slot_id
      JOIN   applicants a      ON a.id = q.applicant_id
-     JOIN   users u           ON u.id = a.user_id ';
+     JOIN   users u           ON u.id = a.user_id
+     LEFT JOIN exam_results er ON er.applicant_id = a.id ';
 
 $orderTail =
     ' ORDER BY
@@ -280,18 +194,14 @@ if ($canSeeAll && !$showAll) {
     // Admin / SSO with a specific college picked - scope by slot department.
     $stmt = $db->prepare(
         $selectCols .
-        ' WHERE s.department = ?' . $dateWhereSql .
+        ' WHERE s.department = ?' .
         $orderTail
     );
-    $stmt->execute(array_merge([$collegeFilter], $dateWhereParams));
+    $stmt->execute([$collegeFilter]);
 } elseif ($canSeeAll) {
     // Admin / SSO with the explicit "all" escape hatch - every row, every college.
-    $stmt = $db->prepare(
-        $selectCols .
-        ($dateWhereSql !== '' ? ' WHERE 1 ' . $dateWhereSql : '') .
-        $orderTail
-    );
-    $stmt->execute($dateWhereParams);
+    $stmt = $db->prepare($selectCols . $orderTail);
+    $stmt->execute();
 } elseif ($isDean) {
     // Dean — every row whose slot is in their college (oversight).
     // Fall back to the COALESCE(assigned_to, created_by) ownership rule
@@ -300,28 +210,77 @@ if ($canSeeAll && !$showAll) {
     if ($staffDept !== '') {
         $stmt = $db->prepare(
             $selectCols .
-            ' WHERE s.department = ?' . $dateWhereSql .
+            ' WHERE s.department = ?' .
             $orderTail
         );
-        $stmt->execute(array_merge([$staffDept], $dateWhereParams));
+        $stmt->execute([$staffDept]);
     } else {
         $stmt = $db->prepare(
             $selectCols .
-            ' WHERE COALESCE(s.assigned_to, s.created_by) = ?' . $dateWhereSql .
+            ' WHERE COALESCE(s.assigned_to, s.created_by) = ?' .
             $orderTail
         );
-        $stmt->execute(array_merge([$staffId], $dateWhereParams));
+        $stmt->execute([$staffId]);
     }
 } else {
     // Professor — only rows on a session they personally own.
     $stmt = $db->prepare(
         $selectCols .
-        ' WHERE COALESCE(s.assigned_to, s.created_by) = ?' . $dateWhereSql .
+        ' WHERE COALESCE(s.assigned_to, s.created_by) = ?' .
         $orderTail
     );
-    $stmt->execute(array_merge([$staffId], $dateWhereParams));
+    $stmt->execute([$staffId]);
 }
 $rows = $stmt->fetchAll();
+
+// Build the slot + date maps used by the two toolbar dropdowns.
+//
+//   $slotMap  — every distinct slot the visible rows belong to,
+//               with a per-slot applicant count. Drives the
+//               "Filter by slot" dropdown.
+//   $dateMap  — every distinct slot date with a per-date applicant
+//               count and a "past" flag. Drives the
+//               "Filter by date" dropdown.
+//
+// Both filters are pure client-side (the rows already include
+// data-slot / data-date attributes), so there's no extra DB hit.
+$slotMap = [];
+$dateMap = [];
+$todayDate = $today; // YYYY-MM-DD, declared at the top of the file
+foreach ($rows as $r) {
+    $sid  = (int)$r['slot_id'];
+    $date = (string)($r['slot_date'] ?? '');
+    if ($sid > 0 && !isset($slotMap[$sid])) {
+        $slotMap[$sid] = [
+            'id'         => $sid,
+            'date'       => $date,
+            'time'       => $r['slot_time'] ?? '',
+            'end_time'   => $r['slot_end_time'] ?? '',
+            'department' => $r['slot_department'] ?? '',
+            'count'      => 0,
+        ];
+    }
+    if ($sid > 0) $slotMap[$sid]['count']++;
+
+    if ($date !== '') {
+        if (!isset($dateMap[$date])) {
+            $dateMap[$date] = [
+                'date'    => $date,
+                'count'   => 0,
+                'is_past' => $date < $todayDate,
+            ];
+        }
+        $dateMap[$date]['count']++;
+    }
+}
+// Sort slots by date ASC, time ASC.
+usort($slotMap, function ($a, $b) {
+    return ($a['date'] <=> $b['date']) ?: ($a['time'] <=> $b['time']);
+});
+// Sort dates ASC.
+usort($dateMap, function ($a, $b) {
+    return $a['date'] <=> $b['date'];
+});
 
 // Format name as "SURNAME SUFFIX, FIRST MIDDLE" (uses shared helper)
 function queue_format_name(array $r): string {
@@ -382,6 +341,17 @@ ob_start();
     background:var(--bg-elevated);
     color:var(--text-primary);
 }
+.iq-toolbar .iq-filter-select {
+    height:36px;
+    min-height:36px;
+    font-size:var(--text-sm);
+    max-width:340px;
+    border:1px solid var(--border);
+    border-radius:var(--radius-sm);
+    padding:0 var(--space-3);
+    background:var(--bg-elevated);
+    color:var(--text-primary);
+}
 .iq-toolbar .iq-count {
     font-size:var(--text-xs);
     color:var(--text-tertiary);
@@ -411,10 +381,36 @@ ob_start();
     text-overflow:ellipsis;
 }
 
-/* Pass/Fail buttons inside the Evaluation modal */
-.btn-pass { background: var(--success-bg, #d1fae5); color: var(--success, #15803d); border-color: var(--success, #15803d); }
-.btn-fail { background: var(--error-bg, #fee2e2);   color: var(--error, #b91c1c);     border-color: var(--error, #b91c1c); }
+/* Pass/Reject buttons inside the Evaluation modal */
+.btn-pass   { background: var(--success-bg, #d1fae5); color: var(--success, #15803d); border-color: var(--success, #15803d); }
+.btn-reject { background: var(--error-bg, #fee2e2);   color: var(--error, #b91c1c);     border-color: var(--error, #b91c1c); }
 </style>
+
+<?php if ($msg = Session::getFlash('success')): ?>
+    <div id="iq-flash-success" class="alert alert-success" style="margin-bottom:var(--space-4);display:flex;align-items:center;gap:var(--space-3)">
+        <?= icon('ic_fluent_checkmark_circle_24_regular', 16) ?>
+        <span style="flex:1"><?= e($msg) ?></span>
+        <button onclick="this.parentElement.remove()" style="background:none;border:none;cursor:pointer;color:inherit;font-size:18px;line-height:1;padding:0 2px">&times;</button>
+    </div>
+<?php endif; ?>
+<?php if ($msg = Session::getFlash('error')): ?>
+    <div id="iq-flash-error" class="alert alert-error" style="margin-bottom:var(--space-4);display:flex;align-items:center;gap:var(--space-3)">
+        <?= icon('ic_fluent_info_24_regular', 16) ?>
+        <span style="flex:1"><?= e($msg) ?></span>
+        <button onclick="this.parentElement.remove()" style="background:none;border:none;cursor:pointer;color:inherit;font-size:18px;line-height:1;padding:0 2px">&times;</button>
+    </div>
+<?php endif; ?>
+<script>
+// Auto-dismiss flash alerts after 5 seconds
+['iq-flash-success','iq-flash-error'].forEach(function(id) {
+    var el = document.getElementById(id);
+    if (el) setTimeout(function() {
+        el.style.transition = 'opacity .4s';
+        el.style.opacity = '0';
+        setTimeout(function() { el.remove(); }, 400);
+    }, 5000);
+});
+</script>
 
 <!-- ============================================================
      BACK BUTTON / CONTEXT HEADER
@@ -466,17 +462,17 @@ ob_start();
     // ----------------------------------------------------------------
     if ($canSeeAll && $showAll) {
         $emptyTitle = 'No interviews scheduled yet';
-        $emptyBody  = 'Once SSO creates interview sessions and applicants are placed, they will show up here.';
+        $emptyBody  = 'Applicants will appear here once SSO sets up sessions and places them.';
     } elseif ($canSeeAll) {
         $emptyTitle = 'No interviews in ' . $collegeFilter . ' yet';
-        $emptyBody  = 'Once a session in this college is scheduled and applicants are placed, they will show up here.';
+        $emptyBody  = 'Applicants will appear here once a session in this college is set up.';
     } elseif ($isDean) {
         $deptLabel  = $staffDept !== '' ? $staffDept : 'your college';
         $emptyTitle = 'No interviews in ' . $deptLabel . ' yet';
-        $emptyBody  = 'Once a session in your college is scheduled and applicants are placed, they will show up here.';
+        $emptyBody  = 'Applicants will appear here once a session in your college is set up.';
     } else {
         $emptyTitle = 'No interviews assigned to you yet';
-        $emptyBody  = 'Applicants will appear here automatically once SSO places them on a session you own.';
+        $emptyBody  = 'Applicants will appear here once SSO places them on your session.';
     }
 ?>
     <!--
@@ -500,58 +496,67 @@ ob_start();
 <?php else: ?>
 
 <!-- ============================================================
-     TOOLBAR — search + date filter + count
+     TOOLBAR — search + count
 ============================================================ -->
-<?php
-// Preserve other GET params (college, etc.) when changing the date
-// filter so we don't bounce the user back to the college picker.
-$dateFilterBaseQuery = $_GET;
-unset($dateFilterBaseQuery['date']);
-$dateFilterBaseHref = url('/staff/interviews/queue') .
-    (!empty($dateFilterBaseQuery) ? '?' . http_build_query($dateFilterBaseQuery) : '');
-$dateFilterSep = (strpos($dateFilterBaseHref, '?') !== false) ? '&' : '?';
-?>
 <div class="iq-toolbar">
     <div class="iq-search-wrap">
         <?= icon('ic_fluent_search_24_filled', 14, 'position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text-tertiary);pointer-events:none') ?>
         <input type="search" id="iq-filter" placeholder="Filter by name or course…"
                autocomplete="off">
     </div>
-    <?php
-    // Build dropdown options from the dates that actually have queue
-    // rows in the caller's scope. "All dates" is always offered as an
-    // escape hatch.
-    $dateOptions = [];
-    if (!empty($availableDateMap)) {
-        foreach ($availableDateMap as $d => $cnt) {
-            $isToday    = ($d === $today);
-            $isTomorrow = ($d === date('Y-m-d', strtotime('+1 day')));
-            $isPast     = ($d < $today);
-            $label = format_date($d);
-            if ($isToday)         $label .= ' (Today)';
-            elseif ($isTomorrow)  $label .= ' (Tomorrow)';
-            elseif ($isPast)      $label .= ' (Past)';
-            $label .= ' · ' . $cnt . ' applicant' . ($cnt === 1 ? '' : 's');
-            $dateOptions[$d] = $label;
-        }
-    }
-    $dateOptions['all'] = 'All dates · ' . array_sum($availableDateMap)
-        . ' applicant' . (array_sum($availableDateMap) === 1 ? '' : 's');
-    ?>
-    <select id="iq-date-filter"
-            style="height:36px;padding:0 var(--space-3);font-size:var(--text-sm);
-                   border:1px solid var(--border);border-radius:var(--radius-sm);
-                   background:var(--bg-elevated);color:var(--text-primary);min-width:240px"
-            onchange="window.location.href = this.value">
-        <?php foreach ($dateOptions as $val => $label):
-            $href = $dateFilterBaseHref . $dateFilterSep . 'date=' . urlencode($val);
+    <?php if (count($dateMap) > 1): ?>
+    <select id="iq-date-filter" class="form-control iq-filter-select"
+            title="Filter by interview date">
+        <?php
+            // The "All dates" item leads so the page starts unfiltered. The
+            // applicant count next to each row mirrors what's currently visible
+            // in the table (rebuilt client-side as filters change so the badge
+            // and the visible count never drift apart).
+            $totalApplicants = count($rows);
         ?>
-            <option value="<?= e($href) ?>" <?= (string)$dateFilter === (string)$val ? 'selected' : '' ?>>
-                <?= e($label) ?>
+        <option value="" data-count="<?= (int)$totalApplicants ?>">
+            All dates · <?= (int)$totalApplicants ?> applicant<?= $totalApplicants === 1 ? '' : 's' ?>
+        </option>
+        <?php foreach ($dateMap as $d): ?>
+            <option value="<?= e($d['date']) ?>" data-count="<?= (int)$d['count'] ?>">
+                <?= format_date($d['date']) ?><?= $d['is_past'] ? ' (Past)' : '' ?>
+                · <?= (int)$d['count'] ?> applicant<?= (int)$d['count'] === 1 ? '' : 's' ?>
             </option>
         <?php endforeach; ?>
     </select>
-    <span class="iq-count">
+    <?php endif; ?>
+    <?php if (count($slotMap) > 1): ?>
+    <select id="iq-slot-filter" class="form-control iq-filter-select"
+            title="Filter by specific slot within the selected date">
+        <?php $totalSlotApplicants = array_sum(array_column($slotMap, 'count')); ?>
+        <option value="" data-date="" data-count="<?= (int)$totalSlotApplicants ?>">
+            All slots · <?= (int)$totalSlotApplicants ?> applicant<?= $totalSlotApplicants === 1 ? '' : 's' ?>
+        </option>
+        <?php foreach ($slotMap as $sl): ?>
+            <?php
+                $slPast = (string)$sl['date'] !== '' && (string)$sl['date'] < $todayDate;
+                $slLbl  = format_date($sl['date']);
+                if (!empty($sl['time'])) {
+                    $slLbl .= ' · ' . format_time($sl['time']);
+                    if (!empty($sl['end_time'])) {
+                        $slLbl .= ' – ' . format_time($sl['end_time']);
+                    }
+                }
+                if ($slPast) $slLbl .= ' (Past)';
+                if (!empty($sl['department'])) {
+                    $slLbl .= ' · ' . $sl['department'];
+                }
+                $slLbl .= ' · ' . (int)$sl['count'] . ' applicant' . ((int)$sl['count'] === 1 ? '' : 's');
+            ?>
+            <option value="<?= (int)$sl['id'] ?>"
+                    data-date="<?= e($sl['date']) ?>"
+                    data-count="<?= (int)$sl['count'] ?>">
+                <?= e($slLbl) ?>
+            </option>
+        <?php endforeach; ?>
+    </select>
+    <?php endif; ?>
+    <span class="iq-count" id="iq-count">
         <?= count($rows) ?> applicant<?= count($rows) === 1 ? '' : 's' ?>
     </span>
 </div>
@@ -584,40 +589,20 @@ $dateFilterSep = (strpos($dateFilterBaseHref, '?') !== false) ? '&' : '?';
             $isFinal   = in_array($r['status'], ['completed', 'no_show'], true);
             $existing  = $r['interview_notes'] ?? '';
             $haystack  = strtolower($name . ' ' . $course . ' ' . $type);
-            // Evaluation gating:
-            //   • Dean = oversight only (read-only, mirrors Results page).
-            //   • SSO  = setup-only (already bounced above, defensive here).
-            //   • Row's slot_date must be today — past/future rows cannot be
-            //     evaluated since the interview hasn't actually happened yet
-            //     (or the slot has already auto-flipped to no-show).
-            // Evaluation is only allowed on the day of the interview. Both the
-            // "is today" check and the role guard match the server-side check
-            // in modules/interview/staff_action.php so the UI never offers a
-            // button the POST will reject.
-            $rowDate    = isset($r['slot_date']) ? (string)$r['slot_date'] : '';
-            $isTodayRow = $rowDate === $today;
-            $canEval    = !$isDean && !$isSSO && $isTodayRow;
         ?>
-            <tr class="<?= $rowClass ?>" data-name="<?= e($haystack) ?>">
+            <tr class="<?= $rowClass ?>"
+                data-name="<?= e($haystack) ?>"
+                data-slot="<?= (int)$r['slot_id'] ?>"
+                data-date="<?= e($r['slot_date'] ?? '') ?>">
                 <td>
+                    <?php // Single-line row — name only.
+                          // Eval result moved into the Status column.
+                          // Eval notes are in the detail panel that opens on click. ?>
                     <button type="button"
                             class="iq-name-cell iq-name-cell-clickable"
                             data-applicant-panel="<?= (int)$r['app_id'] ?>"
                             title="View applicant details">
                         <span><?= e($name) ?></span>
-                        <?php if ($r['evaluation_result']): ?>
-                            <span class="sub">
-                                Result:
-                                <strong style="color:<?= $r['evaluation_result'] === 'pass' ? 'var(--success)' : 'var(--error)' ?>">
-                                    <?= ucfirst($r['evaluation_result']) ?>
-                                </strong>
-                            </span>
-                        <?php endif; ?>
-                        <?php if ($isFinal && $existing !== ''): ?>
-                            <span class="sub iq-eval-summary" title="<?= e($existing) ?>">
-                                <?= e($existing) ?>
-                            </span>
-                        <?php endif; ?>
                     </button>
                 </td>
 
@@ -637,12 +622,30 @@ $dateFilterSep = (strpos($dateFilterBaseHref, '?') !== false) ? '&' : '?';
                 </td>
 
                 <td>
-                    <span class="badge <?= $badgeClass ?>" style="font-size:var(--text-xs)">
+                    <?php
+                        // For completed rows, surface the eval result (Pass / Decline)
+                        // as the badge itself — same pattern as the Results page.
+                        // For non-completed rows (Scheduled / In Progress / No-show / etc.)
+                        // we still show the queue stage as the badge.
+                        $statusBadgeClass = $badgeClass;
+                        $statusBadgeText  = $badgeText;
+                        if ($r['status'] === 'completed' && $r['evaluation_result']) {
+                            if ($r['evaluation_result'] === 'pass') {
+                                $statusBadgeClass = 'badge-approved';
+                                $statusBadgeText  = 'Pass';
+                            } elseif ($r['evaluation_result'] === 'reject') {
+                                $statusBadgeClass = 'badge-rejected';
+                                $statusBadgeText  = 'Decline';
+                            }
+                        }
+                    ?>
+                    <span class="badge <?= $statusBadgeClass ?>" style="font-size:var(--text-xs)"
+                          <?= ($isFinal && $existing !== '') ? 'title="' . e($existing) . '"' : '' ?>>
                         <?php if ($isInProg): ?>
                             <span style="display:inline-block;width:6px;height:6px;border-radius:50%;
                                          background:#fff;animation:pulse-dot 1.4s infinite;margin-right:4px"></span>
                         <?php endif; ?>
-                        <?= e($badgeText) ?>
+                        <?= e($statusBadgeText) ?>
                     </span>
                 </td>
 
@@ -656,37 +659,31 @@ $dateFilterSep = (strpos($dateFilterBaseHref, '?') !== false) ? '&' : '?';
                             <?= icon('ic_fluent_eye_show_24_regular', 14) ?>
                         </button>
                         <?php if ($isFinal): ?>
-                            <span style="font-size:var(--text-xs);color:var(--text-tertiary)">
-                                <?php if ($r['status'] === 'no_show'): ?>
-                                    Marked no-show
-                                <?php else: ?>
-                                    <?= $r['evaluation_result']
-                                        ? e(ucfirst($r['evaluation_result']))
-                                        : 'Completed' ?>
-                                <?php endif; ?>
-                            </span>
-                        <?php elseif (!$canEval): ?>
-                            <span style="font-size:var(--text-xs);color:var(--text-tertiary)"
-                                  title="<?= $isDean
-                                            ? 'Dean is read-only — only Professors / Admin can evaluate'
-                                            : (!$isTodayRow ? 'Evaluation is only available on the interview\'s scheduled date' : '') ?>">
-                                <?php if ($isDean): ?>
-                                    Read only
-                                <?php elseif (!$isTodayRow): ?>
-                                    <?= e(format_date($r['slot_date'])) ?>
-                                <?php else: ?>
-                                    —
-                                <?php endif; ?>
-                            </span>
+                            <?php // Final-state rows: View-only. The Status
+                                  // column already shows Pass / Decline / No-show,
+                                  // so we don't repeat it here. ?>
                         <?php else: ?>
+                            <?php
+                                $evalData = [
+                                    'queueId' => (int)$r['queue_id'],
+                                    'name'    => $name,
+                                    'course'  => $course,
+                                    'type'    => $type,
+                                    'notes'   => $existing,
+                                    'email'   => $r['student_email'] ?? '',
+                                    'phone'   => $r['student_phone'] ?? '',
+                                    'birthdate' => $r['student_birthdate'] ?? '',
+                                    'sex'     => $r['student_sex'] ?? '',
+                                    'address' => $r['student_address'] ?? '',
+                                    'strand'  => $r['shs_strand'] ?? '',
+                                    'school_year' => $r['school_year'] ?? '',
+                                    'exam_score'  => $r['exam_score'] !== null ? (int)$r['exam_score'] : null,
+                                    'exam_total'  => $r['exam_total'] !== null ? (int)$r['exam_total'] : null,
+                                    'exam_passed' => $r['exam_passed'] !== null ? (int)$r['exam_passed'] : null,
+                                ];
+                            ?>
                             <button type="button" class="btn btn-primary btn-sm"
-                                    onclick="openEvalModal(
-                                        <?= (int)$r['queue_id'] ?>,
-                                        <?= htmlspecialchars(json_encode($name), ENT_QUOTES) ?>,
-                                        <?= htmlspecialchars(json_encode($course), ENT_QUOTES) ?>,
-                                        <?= htmlspecialchars(json_encode($type), ENT_QUOTES) ?>,
-                                        <?= htmlspecialchars(json_encode($existing), ENT_QUOTES) ?>
-                                    )">
+                                    onclick='openEvalModal(<?= htmlspecialchars(json_encode($evalData), ENT_QUOTES) ?>)'>
                                 <?= icon('ic_fluent_edit_24_regular', 13) ?>
                                 Evaluation
                             </button>
@@ -704,10 +701,10 @@ $dateFilterSep = (strpos($dateFilterBaseHref, '?') !== false) ? '&' : '?';
 <?php endif; // empty($rows) ?>
 
 <!-- ============================================================
-     EVALUATION MODAL — notes + Pass / Fail
+     EVALUATION MODAL — notes + Pass / Reject
 ============================================================ -->
 <div id="eval-modal" class="modal-backdrop" style="display:none" aria-hidden="true">
-    <div class="modal" style="max-width:480px">
+    <div class="modal" style="max-width:860px;display:flex;flex-direction:column;overflow:hidden">
         <div class="modal-header">
             <div class="modal-title">Interview Evaluation</div>
             <button class="btn-icon" type="button" onclick="closeEvalModal()">
@@ -715,45 +712,93 @@ $dateFilterSep = (strpos($dateFilterBaseHref, '?') !== false) ? '&' : '?';
             </button>
         </div>
 
-        <form method="POST" id="eval-form" action="">
-            <?= csrf_field() ?>
-            <input type="hidden" name="action" value="complete_with_evaluation">
-            <input type="hidden" name="evaluation_result" id="eval-result-input" value="">
-
-            <div class="modal-body" style="display:flex;flex-direction:column;gap:var(--space-4)">
-                <div style="background:var(--bg-subtle);border-radius:var(--radius-md);
-                            padding:var(--space-3) var(--space-4);font-size:var(--text-sm)">
-                    Applicant: <strong id="eval-name"></strong>
-                    <div style="font-size:var(--text-xs);color:var(--text-tertiary);margin-top:2px">
-                        <span id="eval-type"></span>
-                        <span id="eval-sep" style="margin:0 4px">·</span>
-                        <span id="eval-course"></span>
+        <div style="display:flex;flex:1;overflow:hidden;min-height:0">
+            <!-- LEFT: Applicant details panel -->
+            <div style="width:320px;flex-shrink:0;border-right:1px solid var(--border);padding:var(--space-4) var(--space-5);overflow-y:auto;background:var(--bg-subtle)">
+                <div style="font-weight:var(--weight-semibold);font-size:var(--text-sm);margin-bottom:var(--space-3)">Applicant Details</div>
+                <div style="display:flex;flex-direction:column;gap:var(--space-3);font-size:var(--text-sm)">
+                    <div>
+                        <div style="color:var(--text-tertiary);font-size:var(--text-xs);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:2px">Full Name</div>
+                        <div id="eval-detail-name" style="font-weight:var(--weight-medium)"></div>
+                    </div>
+                    <div id="eval-detail-email-wrap">
+                        <div style="color:var(--text-tertiary);font-size:var(--text-xs);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:2px">Email</div>
+                        <div id="eval-detail-email"></div>
+                    </div>
+                    <div id="eval-detail-phone-wrap" style="display:none">
+                        <div style="color:var(--text-tertiary);font-size:var(--text-xs);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:2px">Phone</div>
+                        <div id="eval-detail-phone"></div>
+                    </div>
+                    <div id="eval-detail-bday-wrap" style="display:none">
+                        <div style="color:var(--text-tertiary);font-size:var(--text-xs);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:2px">Birthdate</div>
+                        <div id="eval-detail-bday"></div>
+                    </div>
+                    <div id="eval-detail-sex-wrap" style="display:none">
+                        <div style="color:var(--text-tertiary);font-size:var(--text-xs);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:2px">Sex</div>
+                        <div id="eval-detail-sex"></div>
+                    </div>
+                    <div id="eval-detail-address-wrap" style="display:none">
+                        <div style="color:var(--text-tertiary);font-size:var(--text-xs);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:2px">Address</div>
+                        <div id="eval-detail-address"></div>
+                    </div>
+                    <div style="border-top:1px solid var(--border);margin:var(--space-1) 0"></div>
+                    <div>
+                        <div style="color:var(--text-tertiary);font-size:var(--text-xs);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:2px">Applicant Type</div>
+                        <div id="eval-detail-type"></div>
+                    </div>
+                    <div>
+                        <div style="color:var(--text-tertiary);font-size:var(--text-xs);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:2px">Course Applied</div>
+                        <div id="eval-detail-course" style="font-weight:var(--weight-medium)"></div>
+                    </div>
+                    <div id="eval-detail-strand-wrap" style="display:none">
+                        <div style="color:var(--text-tertiary);font-size:var(--text-xs);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:2px">SHS Strand</div>
+                        <div id="eval-detail-strand"></div>
+                    </div>
+                    <div id="eval-detail-sy-wrap" style="display:none">
+                        <div style="color:var(--text-tertiary);font-size:var(--text-xs);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:2px">School Year</div>
+                        <div id="eval-detail-sy"></div>
+                    </div>
+                    <div style="border-top:1px solid var(--border);margin:var(--space-1) 0"></div>
+                    <div id="eval-detail-exam-wrap" style="display:none">
+                        <div style="color:var(--text-tertiary);font-size:var(--text-xs);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:2px">Exam Score</div>
+                        <div id="eval-detail-exam" style="font-weight:var(--weight-medium)"></div>
                     </div>
                 </div>
-
-                <div>
-                    <label class="form-label" for="eval-notes">Interview notes</label>
-                    <textarea id="eval-notes" name="interview_notes" class="form-control"
-                              rows="5" placeholder="Interview notes / evaluation remarks…"></textarea>
-                </div>
-
-                <div style="font-size:var(--text-xs);color:var(--text-tertiary)">
-                    Choose Pass or Fail to finalize this interview.
-                </div>
             </div>
 
-            <div class="modal-footer" style="display:flex;gap:var(--space-2);justify-content:flex-end">
-                <button type="button" class="btn btn-ghost" onclick="closeEvalModal()">Cancel</button>
-                <button type="submit" class="btn btn-fail"
-                        onclick="document.getElementById('eval-result-input').value='fail'">
-                    <?= icon('ic_fluent_dismiss_24_regular', 13) ?> Fail
-                </button>
-                <button type="submit" class="btn btn-pass"
-                        onclick="document.getElementById('eval-result-input').value='pass'">
-                    <?= icon('ic_fluent_checkmark_24_regular', 13) ?> Pass
-                </button>
+            <!-- RIGHT: Eval form -->
+            <div style="flex:1;min-width:0;display:flex;flex-direction:column">
+                <form method="POST" id="eval-form" action="" style="display:flex;flex-direction:column;flex:1">
+                    <?= csrf_field() ?>
+                    <input type="hidden" name="action" value="complete_with_evaluation">
+                    <input type="hidden" name="evaluation_result" id="eval-result-input" value="">
+
+                    <div class="modal-body" style="display:flex;flex-direction:column;gap:var(--space-4);flex:1">
+                        <div>
+                            <label class="form-label" for="eval-notes">Interview notes</label>
+                            <textarea id="eval-notes" name="interview_notes" class="form-control"
+                                      rows="7" placeholder="Interview notes / evaluation remarks…"></textarea>
+                        </div>
+
+                        <div style="font-size:var(--text-xs);color:var(--text-tertiary)">
+                            Choose Pass or Decline to finalize this interview.
+                        </div>
+                    </div>
+
+                    <div class="modal-footer" style="display:flex;gap:var(--space-2);justify-content:flex-end">
+                        <button type="button" class="btn btn-ghost" onclick="closeEvalModal()">Cancel</button>
+                        <button type="submit" class="btn btn-reject"
+                                onclick="document.getElementById('eval-result-input').value='reject'">
+                            <?= icon('ic_fluent_dismiss_24_regular', 13) ?> Decline
+                        </button>
+                        <button type="submit" class="btn btn-pass"
+                                onclick="document.getElementById('eval-result-input').value='pass'">
+                            <?= icon('ic_fluent_checkmark_24_regular', 13) ?> Pass
+                        </button>
+                    </div>
+                </form>
             </div>
-        </form>
+        </div>
     </div>
 </div>
 
@@ -761,29 +806,107 @@ $dateFilterSep = (strpos($dateFilterBaseHref, '?') !== false) ? '&' : '?';
      SCRIPT
 ============================================================ -->
 <script>
-// Live filter
-document.getElementById('iq-filter')?.addEventListener('input', (e) => {
-    const term = e.target.value.toLowerCase().trim();
-    document.querySelectorAll('#queue-table tbody tr').forEach(tr => {
-        const haystack = tr.dataset.name || '';
-        tr.style.display = (!term || haystack.includes(term)) ? '' : 'none';
-    });
-});
+// Live filters — combines the name/course search box, the date
+// dropdown and the slot dropdown. The slot dropdown cascades off the
+// date one: picking a date hides slots on other dates and resets the
+// slot filter if its current selection no longer matches.
+(function() {
+    var filterEl = document.getElementById('iq-filter');
+    var dateEl   = document.getElementById('iq-date-filter');
+    var slotEl   = document.getElementById('iq-slot-filter');
+    var countEl  = document.getElementById('iq-count');
+
+    function syncSlotOptions() {
+        if (!slotEl) return;
+        var selectedDate = dateEl ? dateEl.value : '';
+        var currentSlot  = slotEl.value;
+        var stillVisible = false;
+        Array.prototype.forEach.call(slotEl.options, function(opt) {
+            if (opt.value === '') { opt.hidden = false; return; } // keep "All slots"
+            var optDate = opt.getAttribute('data-date') || '';
+            var match   = !selectedDate || optDate === selectedDate;
+            opt.hidden  = !match;
+            if (match && opt.value === currentSlot) stillVisible = true;
+        });
+        // If the previously-selected slot is on a different date, clear it.
+        if (currentSlot && !stillVisible) slotEl.value = '';
+    }
+
+    function applyFilters() {
+        var term       = filterEl ? filterEl.value.toLowerCase().trim() : '';
+        var slotId     = slotEl   ? slotEl.value : '';
+        var dateValue  = dateEl   ? dateEl.value : '';
+        var visible    = 0;
+        document.querySelectorAll('#queue-table tbody tr').forEach(function(tr) {
+            var haystack   = tr.dataset.name || '';
+            var rowSlot    = tr.dataset.slot || '';
+            var rowDate    = tr.dataset.date || '';
+            var matchText  = !term      || haystack.includes(term);
+            var matchSlot  = !slotId    || rowSlot === slotId;
+            var matchDate  = !dateValue || rowDate === dateValue;
+            var show       = matchText && matchSlot && matchDate;
+            tr.style.display = show ? '' : 'none';
+            if (show) visible++;
+        });
+        if (countEl) countEl.textContent = visible + ' applicant' + (visible === 1 ? '' : 's');
+    }
+
+    if (filterEl) filterEl.addEventListener('input', applyFilters);
+    if (dateEl)   dateEl.addEventListener('change', function() { syncSlotOptions(); applyFilters(); });
+    if (slotEl)   slotEl.addEventListener('change', applyFilters);
+
+    // Initial sync in case the page is reloaded with a date already chosen.
+    syncSlotOptions();
+})();
 
 // Evaluation modal handlers
 const evalModal = document.getElementById('eval-modal');
 
-function openEvalModal(queueId, name, course, type, notes) {
+function _showField(id, value) {
+    var wrap = document.getElementById(id + '-wrap');
+    var el   = document.getElementById(id);
+    if (value) {
+        el.textContent = value;
+        if (wrap) wrap.style.display = '';
+    } else {
+        if (wrap) wrap.style.display = 'none';
+    }
+}
+
+function openEvalModal(d) {
     document.getElementById('eval-form').action =
-        '<?= e(url('/staff/interviews/')) ?>' + queueId;
-    document.getElementById('eval-name').textContent  = name || '';
-    document.getElementById('eval-course').textContent = course || '';
-    document.getElementById('eval-type').textContent  = type
-        ? type.charAt(0).toUpperCase() + type.slice(1)
-        : '';
-    document.getElementById('eval-sep').style.display =
-        (course && type) ? '' : 'none';
-    document.getElementById('eval-notes').value = notes || '';
+        '<?= e(url('/staff/interviews/')) ?>' + d.queueId;
+
+    // Applicant details panel
+    document.getElementById('eval-detail-name').textContent = d.name || '';
+    document.getElementById('eval-detail-email').textContent = d.email || '';
+    document.getElementById('eval-detail-type').textContent = d.type ? d.type.charAt(0).toUpperCase() + d.type.slice(1) : '—';
+    document.getElementById('eval-detail-course').textContent = d.course || '—';
+
+    _showField('eval-detail-phone', d.phone);
+    _showField('eval-detail-bday', d.birthdate);
+    _showField('eval-detail-sex', d.sex === 'M' ? 'Male' : (d.sex === 'F' ? 'Female' : ''));
+    _showField('eval-detail-address', d.address);
+    _showField('eval-detail-strand', d.strand);
+    _showField('eval-detail-sy', d.school_year);
+
+    // Exam score
+    var examWrap = document.getElementById('eval-detail-exam-wrap');
+    var examEl   = document.getElementById('eval-detail-exam');
+    if (d.exam_score !== null && d.exam_total !== null) {
+        var scoreText = d.exam_score + '/' + d.exam_total;
+        if (d.exam_passed === 1) {
+            scoreText += ' — <span style="color:var(--success);font-weight:var(--weight-semibold)">Passed</span>';
+        } else if (d.exam_passed === 0) {
+            scoreText += ' — <span style="color:var(--error);font-weight:var(--weight-semibold)">Did not pass</span>';
+        }
+        examEl.innerHTML = scoreText;
+        examWrap.style.display = '';
+    } else {
+        examWrap.style.display = 'none';
+    }
+
+    document.getElementById('eval-notes').value = d.notes || '';
     document.getElementById('eval-result-input').value = '';
     evalModal.style.display = 'flex';
     setTimeout(() => document.getElementById('eval-notes').focus(), 50);
@@ -803,10 +926,10 @@ document.addEventListener('keydown', function (e) {
     }
 });
 
-// Submission guard — make sure the user actually clicked Pass or Fail
+// Submission guard — make sure the user actually clicked Pass or Reject
 document.getElementById('eval-form').addEventListener('submit', function (e) {
     const decision = document.getElementById('eval-result-input').value;
-    if (decision !== 'pass' && decision !== 'fail') {
+    if (decision !== 'pass' && decision !== 'reject') {
         e.preventDefault();
         return false;
     }
